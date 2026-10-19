@@ -3,7 +3,15 @@ import { useState } from 'react'
 import { Button, Input, Select, Tabs, Tag, theme, Typography } from 'antd'
 import { GlobeIcon, KeyRoundIcon, PlusIcon, TrashIcon } from 'lucide-react'
 
-import { createEnvironmentBaseUrl, createEnvironmentValue } from '@/project-environment-utils'
+import {
+  type BaseUrlProtocol,
+  type BaseUrlProtocolDraft,
+  createEnvironmentBaseUrl,
+  createEnvironmentValue,
+  parseBaseUrl,
+  resolveBaseUrlProtocol,
+  serializeBaseUrl,
+} from '@/project-environment-utils'
 import {
   type ApiEnvironment,
   type ApiEnvironmentGlobalParameterSection,
@@ -14,24 +22,6 @@ import {
 
 import { GLOBAL_PARAMETER_LABELS } from './GlobalParametersEditor'
 import { TabValueEditor, ValueEditor } from './ValueEditor'
-
-// 前置 URL 协议与域名拆分：url 仍存完整地址（如 https://api.example.com），仅用于输入展示
-function parseBaseUrl(url: string): { protocol: 'http' | 'https', host: string } {
-  const trimmed = url.trim()
-
-  if (/^http:\/\//i.test(trimmed)) {
-    return { protocol: 'http', host: trimmed.replace(/^http:\/\//i, '') }
-  }
-
-  // 默认 https（含空值、无协议、https:// 开头）
-  return { protocol: 'https', host: trimmed.replace(/^https?:\/\//i, '') }
-}
-
-function serializeBaseUrl(protocol: 'http' | 'https', host: string): string {
-  const h = host.trim()
-
-  return h ? `${protocol}://${h}` : ''
-}
 
 export type GlobalSectionKey = 'globalVariables' | 'globalParameters'
 export type EnvironmentSectionKey = `environment:${string}`
@@ -89,6 +79,15 @@ export function EnvironmentEditor(props: {
   const baseUrls = environment.baseUrls ?? []
   const variables = environment.variables ?? []
   const primaryBaseUrl = baseUrls[0] ?? createEnvironmentBaseUrl()
+  const parsedBaseUrl = parseBaseUrl(primaryBaseUrl.url)
+  // host 为空时 url 会被序列化成空串，协议无处存放，用本地草稿兜底
+  // （草稿按环境 id 隔离，避免切换环境时串值）
+  const [protocolDraft, setProtocolDraft] = useState<BaseUrlProtocolDraft | null>(null)
+  const protocol = resolveBaseUrlProtocol(
+    primaryBaseUrl.url,
+    protocolDraft,
+    environment.id,
+  )
 
   const updatePrimaryUrl = (url: string) => {
     const nextBaseUrls = baseUrls.length > 0 ? baseUrls : [createEnvironmentBaseUrl()]
@@ -157,17 +156,18 @@ export function EnvironmentEditor(props: {
               { value: 'https', label: 'https://' },
             ]}
             style={{ width: 88, flexShrink: 0 }}
-            value={parseBaseUrl(primaryBaseUrl.url).protocol}
-            onChange={(protocol) => {
-              updatePrimaryUrl(serializeBaseUrl(protocol, parseBaseUrl(primaryBaseUrl.url).host))
+            value={protocol}
+            onChange={(nextProtocol: BaseUrlProtocol) => {
+              setProtocolDraft({ envId: environment.id, protocol: nextProtocol })
+              updatePrimaryUrl(serializeBaseUrl(nextProtocol, parsedBaseUrl.host))
             }}
           />
           <Input
             disabled={!editable}
             placeholder="api.example.com"
-            value={parseBaseUrl(primaryBaseUrl.url).host}
+            value={parsedBaseUrl.host}
             onChange={(event) => {
-              updatePrimaryUrl(serializeBaseUrl(parseBaseUrl(primaryBaseUrl.url).protocol, event.target.value))
+              updatePrimaryUrl(serializeBaseUrl(protocol, event.target.value))
             }}
           />
         </div>
