@@ -43,7 +43,7 @@ import { ScriptsPanel } from './params/ScriptsPanel'
 import { buildJsoncBodyFillText } from './bodyJsonc'
 import { buildRequest, type BuildRequestResult } from './buildRequest'
 import { generateCurl } from './curl'
-import { parseHistoryParams } from './historyUtils'
+import { collectEnvironmentBaseUrls, extractPathFromHistoryUrl, parseHistoryParams } from './historyUtils'
 import { executeScript } from './scripts'
 import { useApiRequestRunner } from './useApiRequestRunner'
 import { buildVarMaps, makeResolveVars, useResolvedVarMap } from './useResolvedVarMap'
@@ -650,10 +650,15 @@ export function RunTab() {
     if (!workCopy) { return }
 
     const parsed = parseHistoryParams(item.requestJson.headers ?? [], item.requestJson.url ?? '')
+    // 历史 url 是已拼好环境 baseUrl 的完整地址，需还原为相对路径，否则切换环境不再生效
+    const historyPath = extractPathFromHistoryUrl(
+      item.requestJson.url,
+      collectEnvironmentBaseUrls(projectEnvironments, projectEnvironmentConfig?.environments),
+    )
     const next: ApiDetails = {
       ...workCopy,
       method: (item.requestJson.method ?? workCopy.method) as ApiDetails['method'],
-      path: item.requestJson.url?.split('?')[0] ?? workCopy.path,
+      path: historyPath || workCopy.path,
       parameters: {
         ...workCopy.parameters,
         query: parsed.query,

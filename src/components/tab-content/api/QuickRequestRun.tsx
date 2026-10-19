@@ -45,7 +45,7 @@ import { ScriptsPanel } from './params/ScriptsPanel'
 import { buildJsoncBodyFillText } from './bodyJsonc'
 import { buildRequest, type BuildRequestResult } from './buildRequest'
 import { generateCurl } from './curl'
-import { parseHistoryParams } from './historyUtils'
+import { collectEnvironmentBaseUrls, extractPathFromHistoryUrl, parseHistoryParams } from './historyUtils'
 import { executeScript } from './scripts'
 import { useApiRequestRunner } from './useApiRequestRunner'
 import { useResolvedVarMap } from './useResolvedVarMap'
@@ -534,12 +534,18 @@ export function QuickRequestRun() {
 
   const handleApplyHistory = (item: RequestHistoryItem) => {
     const parsed = parseHistoryParams(item.requestJson.headers ?? [], item.requestJson.url ?? '')
+    // 历史 url 是已拼好环境 baseUrl 的完整地址，需还原为相对路径，否则切换环境不再生效
+    const historyPath = extractPathFromHistoryUrl(
+      item.requestJson.url,
+      collectEnvironmentBaseUrls(projectEnvironments, projectEnvironmentConfig?.environments),
+    )
+
     setBodyRawText(undefined)
     setWorkCopy((prev) => {
       const next = {
         ...prev,
         method: (item.requestJson.method ?? prev.method) as ApiDetails['method'],
-        path: item.requestJson.url?.split('?')[0] ?? prev.path,
+        path: historyPath || prev.path,
         parameters: {
           ...prev.parameters,
           query: parsed.query,
