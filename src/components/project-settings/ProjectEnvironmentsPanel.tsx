@@ -14,7 +14,7 @@ import {
   EMPTY_PROJECT_ENVIRONMENT_CONFIG,
   getPrimaryEnvironmentUrl,
 } from '@/project-environment-utils'
-import type { ProjectEnvironmentConfig } from '@/types'
+import type { ApiEnvironment, ProjectEnvironmentConfig } from '@/types'
 
 import {
   createEnvironmentKey,
@@ -45,7 +45,7 @@ function updateValueSection(
 export function ProjectEnvironmentsPanel(props: { editable: boolean }) {
   const { editable } = props
   const { token } = theme.useToken()
-  const { messageApi } = useGlobalContext()
+  const { messageApi, modal } = useGlobalContext()
   const { projectEnvironmentConfig, updateProjectEnvironmentConfig } = useMenuHelpersContext()
   const { sessionVars } = useSessionVariablesContext()
   const [draftConfig, setDraftConfig] = useState<ProjectEnvironmentConfig>(EMPTY_PROJECT_ENVIRONMENT_CONFIG)
@@ -67,6 +67,25 @@ export function ProjectEnvironmentsPanel(props: { editable: boolean }) {
   }
 
   useCtrlSave(handleEnvSave)
+
+  const handleDeleteEnvironment = (environment: ApiEnvironment) => {
+    modal.confirm({
+      title: `删除环境「${environment.name.trim() || '未命名环境'}」？`,
+      content: '该环境的变量、参数与前置 URL 将一并移除。保存前可点击「重置」撤销。',
+      okText: '删除',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: () => {
+        setDraftConfig((current) => {
+          const nextEnvironments = current.environments.filter(({ id }) => id !== environment.id)
+          const nextConfig = { ...current, environments: nextEnvironments }
+          setSelectedKey(getFallbackSection(nextConfig))
+
+          return nextConfig
+        })
+      },
+    })
+  }
 
   useEffect(() => {
     setDraftConfig(cloneConfig(projectEnvironmentConfig))
@@ -199,13 +218,7 @@ export function ProjectEnvironmentsPanel(props: { editable: boolean }) {
                       }))
                     }}
                     onDelete={() => {
-                      setDraftConfig((current) => {
-                        const nextEnvironments = current.environments.filter(({ id }) => id !== selectedEnvironment.id)
-                        const nextConfig = { ...current, environments: nextEnvironments }
-                        setSelectedKey(getFallbackSection(nextConfig))
-
-                        return nextConfig
-                      })
+                      handleDeleteEnvironment(selectedEnvironment)
                     }}
                   />
                 )
