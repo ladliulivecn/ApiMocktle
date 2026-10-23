@@ -52,7 +52,6 @@ interface BodyPanelProps {
   onFillBody?: () => void
   fillWithComments?: boolean
   onFillWithCommentsChange?: (value: boolean) => void
-  buildBodyExample?: () => string
   /** 已定义变量映射（环境/全局/会话），用于补全与 form-data 表格变量提示 */
   varMap?: Map<string, string>
 }
@@ -67,7 +66,6 @@ export function BodyPanel(props: BodyPanelProps) {
     onFillBody,
     fillWithComments = true,
     onFillWithCommentsChange,
-    buildBodyExample,
     varMap,
   } = props
 
@@ -181,7 +179,7 @@ export function BodyPanel(props: BodyPanelProps) {
                 readOnly: false,
                 automaticLayout: true,
               }}
-              value={bodyRawText ?? (requestBody.type === BodyType.Json ? (buildBodyExample?.() ?? '') : '')}
+              value={bodyRawText ?? ''}
               onChange={(val) => {
                 if (onBodyRawTextChange) {
                   onBodyRawTextChange(typeof val === 'string' ? val : '')

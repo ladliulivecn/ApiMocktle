@@ -307,6 +307,8 @@ export function DropdownActions(props: React.PropsWithChildren<DropdownActionsPr
           : undefined,
         resolveVars,
         buildBodyExample,
+        // 批量运行没有 Body 编辑界面，无法手动「一键填充」，保持按文档定义发送的旧行为
+        fallbackBodyExample: true,
         apiDetails: details,
         menuRawList,
         insecureSkipVerify: false,

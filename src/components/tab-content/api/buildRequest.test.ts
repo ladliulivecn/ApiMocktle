@@ -75,3 +75,50 @@ describe('buildRequest GET/HEAD body 守卫', () => {
     expect(result.bodyWarning).toBeUndefined()
   })
 })
+
+describe('buildRequest Body 空值处理', () => {
+  const schemaExample = () => '{"from":"schema"}'
+
+  it('rawText 缺省时默认不兜底，发送空 body 但仍保留 Content-Type', async () => {
+    const result = await buildRequest(baseCtx({
+      method: 'POST',
+      body: { type: BodyType.Json },
+      buildBodyExample: schemaExample,
+    }))
+
+    expect(result.bodyText).toBe('')
+    expect(result.contentType).toBe('application/json')
+  })
+
+  it('rawText 为纯空白时同样视为空，不发送内容', async () => {
+    const result = await buildRequest(baseCtx({
+      method: 'POST',
+      body: { type: BodyType.Json, rawText: '   ' },
+      buildBodyExample: schemaExample,
+    }))
+
+    expect(result.bodyText).toBe('')
+  })
+
+  it('fallbackBodyExample 开启时按 schema 兜底（批量运行路径）', async () => {
+    const result = await buildRequest(baseCtx({
+      method: 'POST',
+      body: { type: BodyType.Json },
+      buildBodyExample: schemaExample,
+      fallbackBodyExample: true,
+    }))
+
+    expect(result.bodyText).toBe('{"from":"schema"}')
+  })
+
+  it('rawText 有内容时原样发送，不使用 schema', async () => {
+    const result = await buildRequest(baseCtx({
+      method: 'POST',
+      body: { type: BodyType.Json, rawText: '{"a":1}' },
+      buildBodyExample: schemaExample,
+      fallbackBodyExample: true,
+    }))
+
+    expect(result.bodyText).toBe('{"a":1}')
+  })
+})

@@ -968,7 +968,6 @@ export function RunTab() {
                   <BodyPanel
                     key={`body-tab-${resetCounter}`}
                     bodyRawText={workCopy.requestBody?.rawText}
-                    buildBodyExample={() => buildBodyExample(workCopy, menuRawList)}
                     fillWithComments={fillWithComments}
                     requestBody={workCopy.requestBody}
                     varMap={varMap}

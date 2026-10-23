@@ -772,7 +772,6 @@ export function QuickRequestRun() {
                 children: (
                   <BodyPanel
                     bodyRawText={bodyRawText ?? workCopy.requestBody?.rawText}
-                    buildBodyExample={() => buildBodyExample(workCopy, menuRawList)}
                     fillWithComments={fillWithComments}
                     requestBody={workCopy.requestBody}
                     varMap={varMap}

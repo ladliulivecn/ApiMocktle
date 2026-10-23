@@ -8,6 +8,8 @@ import { DownloadIcon } from 'lucide-react'
 import { MonacoEditor } from '@/components/MonacoEditor'
 import { useStyles } from '@/hooks/useStyle'
 
+import { ensureExternalLinkOpener } from './monacoExternalLink'
+
 import { css } from '@emotion/css'
 
 interface ResponseBodyViewerProps {
@@ -234,8 +236,16 @@ export function ResponseBodyViewer({
         <MonacoEditor
           height="100%"
           language={language}
-          options={{ readOnly: true, lineNumbers: 'on', minimap: { enabled: false }, scrollBeyondLastLine: false }}
+          options={{
+            readOnly: true,
+            lineNumbers: 'on',
+            minimap: { enabled: false },
+            scrollBeyondLastLine: false,
+            // 响应体中的 URL 支持 Ctrl/Cmd + 点击用系统浏览器打开
+            links: true,
+          }}
           value={displayBody}
+          onMount={(_editor, monaco) => { ensureExternalLinkOpener(monaco) }}
         />
       </div>
     </div>

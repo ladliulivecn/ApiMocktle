@@ -33,6 +33,12 @@ export interface BuildRequestContext {
   resolveVars: (val: string) => string
   /** Json/Xml/Raw 且 rawText 为空时生成示例 */
   buildBodyExample: (apiDetails: ApiDetails, menuRawList?: unknown) => string
+  /**
+   * Json/Xml/Raw 的 rawText 为空时，是否用 schema 示例兜底。
+   * 默认 false：编辑器里空着就发空 Body（所见即所发）。
+   * 批量运行等无编辑界面的路径显式开启，保持「按文档定义发送」的旧行为。
+   */
+  fallbackBodyExample?: boolean
   apiDetails: ApiDetails
   menuRawList?: unknown
   insecureSkipVerify: boolean
@@ -77,7 +83,8 @@ function toText(v: unknown): string {
 export async function buildRequest(ctx: BuildRequestContext): Promise<BuildRequestResult> {
   const {
     method, baseUrl, path, query, header, cookie, body,
-    buildBodyExample, apiDetails, menuRawList, insecureSkipVerify, resolveVars,
+    buildBodyExample, fallbackBodyExample = false,
+    apiDetails, menuRawList, insecureSkipVerify, resolveVars,
   } = ctx
 
   // ===== 收集模板字段（与解析结果同序）=====
@@ -88,8 +95,15 @@ export async function buildRequest(ctx: BuildRequestContext): Promise<BuildReque
   const isJsonXmlRaw = body != null
     && body.type !== BodyType.None
     && (body.type === BodyType.Json || body.type === BodyType.Xml || body.type === BodyType.Raw)
-  // Json/Xml/Raw 且 rawText 为空时生成示例（示例内容也可能含变量）
-  const bodyRaw = isJsonXmlRaw ? (body?.rawText ?? buildBodyExample(apiDetails, menuRawList)) : ''
+  // Json/Xml/Raw 的原文：默认按编辑器内容原样发送（空即空，所见即所发）。
+  // 仅当 fallbackBodyExample 显式开启且内容为空（含纯空白）时，才用 schema 示例兜底。
+  const rawBodyText = body?.rawText
+  const hasRawBodyText = rawBodyText != null && rawBodyText.trim() !== ''
+  const bodyRaw = isJsonXmlRaw
+    ? (hasRawBodyText
+        ? rawBodyText
+        : (fallbackBodyExample ? buildBodyExample(apiDetails, menuRawList) : ''))
+    : ''
   const bodyParams = (body?.type === BodyType.FormData || body?.type === BodyType.UrlEncoded)
     ? (body.parameters ?? []).filter((p) => p.name && p.enable !== false && p.type !== 'file')
     : []
