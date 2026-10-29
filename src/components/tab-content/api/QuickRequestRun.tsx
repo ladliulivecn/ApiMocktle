@@ -165,8 +165,8 @@ export function QuickRequestRun() {
     return createEmptyApiDetails()
   })
 
-  const [bodyRawText, setBodyRawText] = useState<string | undefined>(undefined)
   // 各 body 类型的文本缓存：切换类型时保存/恢复，避免内容丢失
+  // Body 原文只有单一真源：workCopy.requestBody.rawText（草稿与落库都读它）
   const bodyTextsRef = useRef<Partial<Record<BodyType, string>>>({})
   const [fillWithComments, setFillWithComments] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -256,7 +256,6 @@ export function QuickRequestRun() {
   useEffect(() => {
     if (savedData && !isCreating) {
       setWorkCopy(JSON.parse(JSON.stringify(savedData)) as ApiDetails)
-      setBodyRawText(undefined)
     }
   }, [savedData?.id, isCreating])
 
@@ -405,7 +404,7 @@ export function QuickRequestRun() {
       body: workCopy.requestBody
         ? {
             type: workCopy.requestBody.type,
-            rawText: bodyRawText ?? workCopy.requestBody.rawText,
+            rawText: workCopy.requestBody.rawText,
             parameters: allBodyParams,
           }
         : undefined,
@@ -540,7 +539,6 @@ export function QuickRequestRun() {
       collectEnvironmentBaseUrls(projectEnvironments, projectEnvironmentConfig?.environments),
     )
 
-    setBodyRawText(undefined)
     setWorkCopy((prev) => {
       const next = {
         ...prev,
@@ -575,7 +573,11 @@ export function QuickRequestRun() {
     const text = fillWithComments
       ? buildJsoncBodyFillText(workCopy, menuRawList)
       : buildBodyFillText(workCopy, menuRawList)
-    setBodyRawText(text)
+
+    setWorkCopy((prev) => ({
+      ...prev,
+      requestBody: { ...(prev.requestBody ?? { type: BodyType.None }), rawText: text },
+    }))
   }
 
   const handleTitleConfirm = async () => {
@@ -771,7 +773,7 @@ export function QuickRequestRun() {
                 label: <TabLabel hasContent={hasBodyContent}>Body</TabLabel>,
                 children: (
                   <BodyPanel
-                    bodyRawText={bodyRawText ?? workCopy.requestBody?.rawText}
+                    bodyRawText={workCopy.requestBody?.rawText}
                     fillWithComments={fillWithComments}
                     requestBody={workCopy.requestBody}
                     varMap={varMap}
@@ -781,22 +783,29 @@ export function QuickRequestRun() {
                         requestBody: { ...(prev.requestBody ?? { type: BodyType.None }), parameters: parameters },
                       }))
                     }}
-                    onBodyRawTextChange={(text) => { setBodyRawText(text) }}
+                    onBodyRawTextChange={(text) => {
+                      setWorkCopy((prev) => ({
+                        ...prev,
+                        requestBody: { ...(prev.requestBody ?? { type: BodyType.None }), rawText: text },
+                      }))
+                    }}
                     onBodyTypeChange={(type) => {
                       const oldType = workCopy.requestBody?.type
+                      const oldText = workCopy.requestBody?.rawText
 
-                      if (oldType && oldType !== type && bodyRawText?.trim()) {
+                      if (oldType && oldText !== undefined) {
+                        bodyTextsRef.current[oldType] = oldText
+                      }
+
+                      if (oldType && oldType !== type && oldText?.trim()) {
                         messageApi.info('已保留原 Body 内容，可切换回原类型恢复')
                       }
 
-                      if (oldType && bodyRawText !== undefined) {
-                        bodyTextsRef.current[oldType] = bodyRawText
-                      }
+                      const nextText = type === oldType ? oldText : bodyTextsRef.current[type]
 
-                      setBodyRawText(type === oldType ? bodyRawText : bodyTextsRef.current[type])
                       setWorkCopy((prev) => ({
                         ...prev,
-                        requestBody: { ...(prev.requestBody ?? { type: BodyType.None }), type },
+                        requestBody: { ...(prev.requestBody ?? { type: BodyType.None }), type, rawText: nextText },
                       }))
                     }}
                     onFillBody={handleFillBody}
@@ -883,7 +892,7 @@ export function QuickRequestRun() {
                   body: workCopy.requestBody
                     ? {
                         type: workCopy.requestBody.type,
-                        rawText: bodyRawText ?? workCopy.requestBody.rawText,
+                        rawText: workCopy.requestBody.rawText,
                         parameters: [
                           ...(projectEnvironmentConfig?.globalParameters?.body ?? []).map((p) => ({ name: p.name, enable: p.enable, example: p.value! })),
                           ...curlEnvParams.body.map((p) => ({ name: p.name, enable: p.enable, example: p.value! })),
