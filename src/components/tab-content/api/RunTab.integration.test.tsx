@@ -43,6 +43,8 @@ vi.mock('react-resizable-panels', async () => {
   class PanelMock extends Component<{ children?: React.ReactNode }> {
     resize() { /* noop */ }
 
+    getSize() { return 50 }
+
     render() {
       return <div>{this.props.children}</div>
     }
@@ -247,6 +249,11 @@ describe('运行 Tab：Body 跨挂载回显', () => {
 
     // 历史恢复（body 非空）不应把内容改写成其它值
     expect(bodyEditor(second.container).value).toBe('{"amount":100}')
+
+    // 最近一次运行结果也应恢复展示：结果区停在「响应内容」
+    await waitFor(() => {
+      expect(screen.getByRole('tab', { name: '响应内容' })?.getAttribute('aria-selected')).toBe('true')
+    })
   })
 
   it('菜单数据晚于首帧到达时仍能恢复本地副本（不因时序丢 Body）', async () => {

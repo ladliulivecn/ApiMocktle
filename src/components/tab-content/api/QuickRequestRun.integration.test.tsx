@@ -19,10 +19,12 @@ interface SavedItem {
 const h = vi.hoisted(() => {
   const state: {
     item: SavedItem | undefined
+    history: unknown[]
     updateMenuItem: ReturnType<typeof vi.fn>
     saveDraft: ReturnType<typeof vi.fn>
   } = {
     item: undefined,
+    history: [],
     updateMenuItem: vi.fn(),
     saveDraft: vi.fn(),
   }
@@ -41,6 +43,8 @@ vi.mock('react-resizable-panels', async () => {
 
   class PanelMock extends Component<{ children?: React.ReactNode }> {
     resize() { /* noop */ }
+
+    getSize() { return 50 }
 
     render() {
       return <div>{this.props.children}</div>
@@ -103,7 +107,9 @@ vi.mock('@/contexts/menu-helpers', () => ({
 
 vi.mock('@/api-client', () => ({
   apiRaw: vi.fn(),
-  api: vi.fn(() => Promise.resolve([])),
+  api: vi.fn((action: string) => Promise.resolve(
+    action === 'list_request_history' ? h.state.history : [],
+  )),
 }))
 
 import { QuickRequestRun } from './QuickRequestRun'
@@ -148,6 +154,7 @@ function bodyEditor(container: HTMLElement): HTMLTextAreaElement {
 describe('快捷请求：Body 落库与回显', () => {
   beforeEach(() => {
     h.state.item = { id: 'qr-1', name: '快捷请求', data: makeQuickRequest() }
+    h.state.history = []
     h.state.updateMenuItem = vi.fn((payload: { id: string, name: string, data: ApiDetails }) => {
       // 模拟落库：后续重挂载读到的就是这次写入的数据
       h.state.item = { id: payload.id, name: payload.name, data: payload.data }
@@ -236,5 +243,45 @@ describe('快捷请求：Body 落库与回显', () => {
     const payload = h.state.updateMenuItem.mock.calls.at(-1)?.[0] as { data: ApiDetails }
 
     expect(payload.data.requestBody).toMatchObject({ type: BodyType.Json, rawText: '{"a":1}' })
+  })
+
+  it('进入快捷请求时展示最近一次请求结果', async () => {
+    h.state.history = [{
+      requestJson: { url: 'http://httpbin.org/post', method: 'POST', headers: [], body: '{"a":1}' },
+      responseJson: {
+        url: 'http://httpbin.org/post',
+        method: 'POST',
+        status: 200,
+        statusText: 'OK',
+        durationMs: 12,
+        contentType: 'application/json',
+        headers: [],
+        requestHeaders: [],
+        requestQuery: [],
+        requestCookie: [],
+        requestBodyParameters: [],
+        requestBodyText: '{"a":1}',
+        body: '{"ok":true}',
+      },
+    }]
+
+    render(<QuickRequestRun />)
+
+    // 结果区恢复：默认停在「响应内容」，并渲染历史响应体
+    await waitFor(() => {
+      expect(screen.getByRole('tab', { name: '响应内容' })?.getAttribute('aria-selected')).toBe('true')
+    })
+
+    expect(screen.getByText(/200 OK/)).toBeTruthy()
+  })
+
+  it('从未请求过时不展示结果区（保持空态提示）', async () => {
+    const view = render(<QuickRequestRun />)
+
+    await waitFor(() => {
+      expect(screen.queryByRole('tab', { name: '响应内容' })).toBeNull()
+    })
+
+    expect(view.container.textContent).toContain('查看响应')
   })
 })

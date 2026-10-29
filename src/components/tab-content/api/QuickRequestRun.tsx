@@ -16,12 +16,15 @@ import {
 } from 'antd'
 import { ClockIcon, CopyIcon, PencilIcon, PlayIcon } from 'lucide-react'
 import { nanoid } from 'nanoid'
+import { useParams } from 'react-router'
 
+import { api } from '@/api-client'
 import type { ApiMenuData } from '@/components/ApiMenu/ApiMenu.type'
 import { PageTabStatus } from '@/components/ApiTab/ApiTab.enum'
 import { useTabContentContext } from '@/components/ApiTab/TabContentContext'
 import { buildSchemaExample } from '@/components/JsonSchema/schema-normalizer'
 import { HTTP_METHOD_CONFIG } from '@/configs/static'
+import { useAuth } from '@/contexts/auth'
 import { useGlobalContext } from '@/contexts/global'
 import { isDraftEmpty } from '@/contexts/menu-drafts'
 import { useMenuHelpersContext } from '@/contexts/menu-helpers'
@@ -32,7 +35,7 @@ import { BodyType, MenuItemType, ParamType } from '@/enums'
 import { useCtrlSave } from '@/hooks/useCtrlSave'
 import { useTabSaveBridge } from '@/hooks/useTabSaveBridge'
 import { getPrimaryEnvironmentUrl } from '@/project-environment-utils'
-import { type ApiDetails, type RunTabInfo, type ScriptConsoleEntry, type ScriptTestResult } from '@/types'
+import { type ApiDetails, type ApiRunResult, type RunTabInfo, type ScriptConsoleEntry, type ScriptTestResult } from '@/types'
 
 import { HistoryPanel, type RequestHistoryItem } from './components/HistoryPanel'
 import { ResponsePanel } from './components/ResponsePanel'
@@ -145,6 +148,8 @@ export function QuickRequestRun() {
   const { setTabItemStatus, setTabItemEditStatus } = useMenuTabHelpers()
   const { activeTabKey } = useMenuTabContext()
   const { sessionVars, setSessionVars } = useSessionVariablesContext()
+  const { sessionId } = useAuth()
+  const { projectId } = useParams()
 
   const isCreating = tabData.data?.tabStatus === PageTabStatus.Create
 
@@ -259,7 +264,41 @@ export function QuickRequestRun() {
     }
   }, [savedData?.id, isCreating])
 
-  const { run, running, result, error } = useApiRequestRunner()
+  const { run, running, result, error, setResult } = useApiRequestRunner()
+
+  // 进入快捷请求时恢复最近一次请求结果（含请求内容）：
+  // 已入库项才有 menuItemId；新建态没有历史，保持空态提示。
+  const resultRef = useRef(result)
+  resultRef.current = result
+  const restoredKeyRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    if (isCreating || !tabData.key || !projectId || !sessionId) { return }
+
+    if (restoredKeyRef.current === tabData.key) { return }
+
+    restoredKeyRef.current = tabData.key
+
+    const loadLastResult = async () => {
+      try {
+        const list = await api<{ responseJson: ApiRunResult }[]>('list_request_history', {
+          sessionId,
+          projectId,
+          menuItemId: tabData.key,
+        })
+
+        // 等待期间用户已发起新请求时，不用旧结果覆盖
+        if (list.length > 0 && !resultRef.current) {
+          setResult(list[0].responseJson)
+        }
+      }
+      catch {
+        // 历史不可用（未登录 / 无权限 / 从未运行）时保持空态
+      }
+    }
+
+    void loadLastResult()
+  }, [tabData.key, projectId, sessionId, isCreating, setResult])
 
   // ---- 草稿持久化 ----
   const buildRunTabInfo = useCallback((data: ApiDetails): RunTabInfo => ({
