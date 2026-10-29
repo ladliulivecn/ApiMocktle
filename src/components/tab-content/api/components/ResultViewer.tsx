@@ -1,6 +1,6 @@
 'use client'
 
-import { type ReactNode, useEffect, useMemo, useState } from 'react'
+import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams } from 'react-router'
 
 import {
@@ -104,6 +104,17 @@ export function ResultViewer({ result, error, curlContent, onRetry, menuItemId, 
   useEffect(() => {
     setShowFormatted(isJson && !isLarge)
   }, [result?.body, result?.contentType, isJson, isLarge])
+
+  // 结果异步到达（运行完成 / 恢复历史结果）时切到响应内容页签；
+  // 只跟随 result 引用变化，不干扰用户手动切换。
+  const lastResultRef = useRef(result)
+
+  useEffect(() => {
+    if (lastResultRef.current === result) { return }
+
+    lastResultRef.current = result
+    setActiveTab(result?.body != null ? 'resContent' : 'reqContent')
+  }, [result])
 
   const monacoOptions = useMemo(() => ({
     readOnly: true,
