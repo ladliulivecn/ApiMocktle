@@ -71,6 +71,10 @@ export function BodyPanel(props: BodyPanelProps) {
 
   const { token } = theme.useToken()
 
+  // 快捷请求的数据可能没有 requestBody 字段（cURL 导入无请求体、历史数据、示例数据），
+  // 此时仍要渲染类型选择器，否则用户永远无法切到 json / form-data。
+  const body: ApiRequestBody = requestBody ?? { type: BodyType.None }
+
   // 变量补全项：内置动态变量 + 已定义用户变量
   const dynamicDefs = useDynamicVariableDefs()
   const completionItems = useMemo(() => {
@@ -84,17 +88,15 @@ export function BodyPanel(props: BodyPanelProps) {
     return [...dyn, ...users]
   }, [dynamicDefs, varMap])
 
-  const showBodyEditor = requestBody
-    && (requestBody.type === BodyType.Json
-      || requestBody.type === BodyType.Xml
-      || requestBody.type === BodyType.Raw
-      || requestBody.type === BodyType.Binary)
+  const showBodyEditor = body.type === BodyType.Json
+    || body.type === BodyType.Xml
+    || body.type === BodyType.Raw
+    || body.type === BodyType.Binary
 
   // 「一键填充」按钮仅在 json/xml/raw 下显示（不含 binary），与 QuickRequestRun 对齐
-  const showFillButton = requestBody
-    && (requestBody.type === BodyType.Json
-      || requestBody.type === BodyType.Xml
-      || requestBody.type === BodyType.Raw)
+  const showFillButton = body.type === BodyType.Json
+    || body.type === BodyType.Xml
+    || body.type === BodyType.Raw
 
   const handleFillClick = () => {
     if (!onFillBody) { return }
@@ -114,7 +116,7 @@ export function BodyPanel(props: BodyPanelProps) {
     })
   }
 
-  if (!requestBody) {
+  if (!requestBody && !onBodyTypeChange) {
     return <Typography.Text className="px-3 pt-2" type="secondary">无 Body</Typography.Text>
   }
 
@@ -125,12 +127,12 @@ export function BodyPanel(props: BodyPanelProps) {
         <div className="mb-1 flex items-center justify-between gap-2">
           <div className="flex flex-wrap items-center gap-1">
             {bodyTypeOptions.map(({ n, t }) => {
-              const hasContent = bodyTypeHasContent(requestBody, t)
+              const hasContent = bodyTypeHasContent(body, t)
 
               return (
                 <Tag.CheckableTag
                   key={t}
-                  checked={requestBody.type === t}
+                  checked={body.type === t}
                   onChange={(checked) => {
                     if (checked && onBodyTypeChange) {
                       onBodyTypeChange(t)
@@ -169,9 +171,9 @@ export function BodyPanel(props: BodyPanelProps) {
               deserializeOnChange={false}
               height="100%"
               language={
-                requestBody.type === BodyType.Xml
+                body.type === BodyType.Xml
                   ? 'xml'
-                  : requestBody.type === BodyType.Raw
+                  : body.type === BodyType.Raw
                     ? 'plaintext'
                     : 'json'
               }
@@ -193,22 +195,22 @@ export function BodyPanel(props: BodyPanelProps) {
           </div>
         )}
 
-        {(requestBody.type === BodyType.FormData || requestBody.type === BodyType.UrlEncoded) && (
+        {(body.type === BodyType.FormData || body.type === BodyType.UrlEncoded) && (
           <div className="h-full overflow-auto">
             <Typography.Text className="mb-2 block text-xs" type="secondary">
-              {requestBody.type === BodyType.FormData ? 'form-data' : 'x-www-form-urlencoded'} 参数
+              {body.type === BodyType.FormData ? 'form-data' : 'x-www-form-urlencoded'} 参数
             </Typography.Text>
             <ParamsEditableTable
               showDescriptionColumn={false}
               showRequiredColumn={false}
-              value={requestBody.parameters}
+              value={body.parameters}
               varMap={varMap}
               onChange={(params) => onBodyParametersChange?.(params ?? [])}
             />
           </div>
         )}
 
-        {requestBody.type === BodyType.None && (
+        {body.type === BodyType.None && (
           <Typography.Text className="text-xs" type="secondary">无请求体</Typography.Text>
         )}
       </div>

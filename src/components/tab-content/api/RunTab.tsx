@@ -579,7 +579,7 @@ export function RunTab() {
       : buildBodyFillText(workCopy, menuRawList)
     const next = {
       ...workCopy,
-      requestBody: { ...workCopy.requestBody!, rawText: text },
+      requestBody: { ...(workCopy.requestBody ?? { type: BodyType.None }), rawText: text },
     }
     setWorkCopy(next)
     persist(next)
@@ -961,7 +961,10 @@ export function RunTab() {
                     onBodyRawTextChange={(text) => {
                       const next = {
                         ...workCopy,
-                        requestBody: { ...workCopy.requestBody!, rawText: text },
+                        requestBody: {
+                          ...(workCopy.requestBody ?? { type: BodyType.None }),
+                          rawText: text,
+                        },
                       }
                       setWorkCopy(next)
                       persist(next)
@@ -981,7 +984,11 @@ export function RunTab() {
                       const nextText = type === oldType ? oldText : bodyTextsRef.current[type]
                       const next = {
                         ...workCopy,
-                        requestBody: { ...workCopy.requestBody!, type, rawText: nextText },
+                        requestBody: {
+                          ...(workCopy.requestBody ?? { type: BodyType.None }),
+                          type,
+                          rawText: nextText,
+                        },
                       }
                       setWorkCopy(next)
                       persist(next)
