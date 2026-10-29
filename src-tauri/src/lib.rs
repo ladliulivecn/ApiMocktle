@@ -3,6 +3,7 @@ pub mod db;
 mod errors;
 pub mod http;
 pub mod models;
+mod portable;
 pub mod services;
 
 
@@ -14,11 +15,19 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 便携版：WebView2 的 localStorage 也要进 <exe>/data，须在建环境前设置
+    portable::apply_webview2_user_data_folder();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .setup(|app| {
+            // 便携版只认 <exe 同级>/data，不回退 app_data_dir，避免读到安装版数据
+            #[cfg(feature = "portable")]
+            let app_data_dir = portable::base_data_dir()
+                .expect("便携版无法创建 exe 同级 data 目录（所在目录只读或无权限），请把程序放到可写目录下");
+            #[cfg(not(feature = "portable"))]
             let app_data_dir = app.path().app_data_dir().expect("Failed to get app data dir");
             let db = Arc::new(init_database(&app_data_dir));
             // 内置动态变量 seed（幂等）+ 引擎定义缓存；失败不阻断启动，IPC 保存时也会刷新
