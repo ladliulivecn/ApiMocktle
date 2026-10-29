@@ -205,4 +205,36 @@ describe('快捷请求：Body 落库与回显', () => {
 
     expect(payload.data.requestBody?.rawText).toBe('{"a":1}')
   })
+
+  it('数据里没有 requestBody（cURL 导入无 body / 旧数据）时仍能选择 Body 类型', async () => {
+    h.state.item = {
+      id: 'qr-1',
+      name: 'httpbin 测试',
+      data: makeQuickRequest({ path: 'http://httpbin.org/post', requestBody: undefined }),
+    }
+
+    const view = render(<QuickRequestRun />)
+
+    // 旧行为：直接显示「无 Body」，类型标签整行消失，用户无法切换
+    expect(screen.queryByText('无 Body')).toBeNull()
+    expect(screen.getByText('form-data')).toBeTruthy()
+    expect(screen.getByText('json')).toBeTruthy()
+
+    fireEvent.click(screen.getByText('json'))
+
+    await waitFor(() => {
+      expect(view.container.querySelector('textarea')).toBeTruthy()
+    })
+
+    fireEvent.change(bodyEditor(view.container), { target: { value: '{"a":1}' } })
+    fireEvent.click(screen.getByRole('button', { name: '保 存' }))
+
+    await waitFor(() => {
+      expect(h.state.updateMenuItem).toHaveBeenCalled()
+    })
+
+    const payload = h.state.updateMenuItem.mock.calls.at(-1)?.[0] as { data: ApiDetails }
+
+    expect(payload.data.requestBody).toMatchObject({ type: BodyType.Json, rawText: '{"a":1}' })
+  })
 })
