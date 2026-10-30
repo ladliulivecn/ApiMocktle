@@ -325,13 +325,24 @@ fn split_folder_path(folder: &str) -> Vec<String> {
 
 /// 逐段确保目录存在，返回最深一级目录 id（无层级时返回 None）。
 /// 同级同名目录直接复用，保证重复导入不产生重复目录。
+/// 导入过程中的可变上下文：排序号、目录路径缓存、查重索引。
+///
+/// 收拢成结构体而不是给每个函数加参数 —— 参数超过 7 个后调用点已经读不出
+/// 「谁负责改什么」。
+struct ImportCtx {
+    sort_order: i32,
+    /// 目录全路径 → 目录 id，避免同一条路径反复解析
+    folder_cache: HashMap<String, String>,
+    /// 一次性建立的查重索引
+    index: menu_repo::MenuIndex,
+}
+
 fn ensure_folder_path(
     db: &Db,
     project_id: &str,
     segments: &[String],
     description: &str,
-    sort_order: &mut i32,
-    cache: &mut HashMap<String, String>,
+    ctx: &mut ImportCtx,
 ) -> Result<Option<String>, AppError> {
     let mut parent_id: Option<String> = None;
     let mut key = String::new();
@@ -342,19 +353,17 @@ fn ensure_folder_path(
         }
         key.push_str(segment);
 
-        if let Some(cached) = cache.get(&key) {
+        if let Some(cached) = ctx.folder_cache.get(&key) {
             parent_id = Some(cached.clone());
             continue;
         }
 
-        let folder_id = match menu_repo::find_menu_item_by_name(
-            db,
-            project_id,
-            parent_id.as_deref(),
-            segment,
-            "apiDetailFolder",
-        )? {
-            Some(item) => item.id,
+        let folder_id = match ctx
+            .index
+            .menu_id(parent_id.as_deref(), "apiDetailFolder", segment)
+            .map(str::to_string)
+        {
+            Some(id) => id,
             None => {
                 let id = Uuid::new_v4().to_string();
                 let payload = CreateMenuItemPayload {
@@ -367,14 +376,16 @@ fn ensure_folder_path(
                         "description": description,
                     })),
                     run_tab_json: None,
-                    sort_order: Some(*sort_order),
+                    sort_order: Some(ctx.sort_order),
                 };
                 menu_repo::create_menu_item(db, project_id, &payload)?;
-                *sort_order += 1;
+                ctx.sort_order += 1;
                 id
             }
         };
-        cache.insert(key.clone(), folder_id.clone());
+        ctx.index
+            .remember_menu(parent_id.as_deref(), "apiDetailFolder", segment, &folder_id);
+        ctx.folder_cache.insert(key.clone(), folder_id.clone());
         parent_id = Some(folder_id);
     }
 
@@ -388,8 +399,7 @@ fn resolve_parent_folder(
     operation: &Value,
     op_tags: &[String],
     tags_info: &[TagInfo],
-    sort_order: &mut i32,
-    cache: &mut HashMap<String, String>,
+    ctx: &mut ImportCtx,
 ) -> Result<Option<String>, AppError> {
     let folder_path = operation
         .get("x-apifox-folder")
@@ -409,8 +419,7 @@ fn resolve_parent_folder(
         project_id,
         &split_folder_path(&folder_path),
         &description,
-        sort_order,
-        cache,
+        ctx,
     )
 }
 
@@ -433,21 +442,19 @@ fn upsert_api_detail(
     db: &Db,
     project_id: &str,
     api: ImportedApi<'_>,
-    sort_order: &mut i32,
     now: &str,
+    ctx: &mut ImportCtx,
 ) -> Result<(), AppError> {
-    let existing = menu_repo::find_api_by_path_method(db, project_id, api.path, api.method)?;
+    // 查重走一次性建立的索引，不再每条全表扫描 + 解析 data_json
+    let existing = ctx
+        .index
+        .api_entry(api.method, api.path)
+        .map(|(id, created_at)| (id.to_string(), created_at.map(str::to_string)));
     let (api_id, created_at) = match &existing {
-        Some(item) => {
-            let created_at = item
-                .data_json
-                .as_ref()
-                .and_then(|d| d.get("createdAt"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| now.to_string());
-            (item.id.clone(), created_at)
-        }
+        Some((id, created_at)) => (
+            id.clone(),
+            created_at.clone().unwrap_or_else(|| now.to_string()),
+        ),
         None => (Uuid::new_v4().to_string(), now.to_string()),
     };
 
@@ -467,15 +474,17 @@ fn upsert_api_detail(
     });
 
     match existing {
-        Some(item) => {
+        Some((item_id, _)) => {
             let mut updates = serde_json::json!({ "name": api.name, "data": data_json });
             // 只有明确归属目录时才移动，避免把已有归位信息清空
             if api.parent_id.is_some() {
                 updates["parentId"] = serde_json::json!(api.parent_id);
             }
-            menu_repo::update_menu_item(db, project_id, &item.id, &updates)?;
+            menu_repo::update_menu_item(db, project_id, &item_id, &updates)?;
         }
         None => {
+            ctx.index
+                .remember_api(api.method, api.path, &api_id, Some(now));
             let payload = CreateMenuItemPayload {
                 id: api_id,
                 parent_id: api.parent_id,
@@ -483,10 +492,10 @@ fn upsert_api_detail(
                 menu_type: "apiDetail".to_string(),
                 data_json: Some(data_json),
                 run_tab_json: None,
-                sort_order: Some(*sort_order),
+                sort_order: Some(ctx.sort_order),
             };
             menu_repo::create_menu_item(db, project_id, &payload)?;
-            *sort_order += 1;
+            ctx.sort_order += 1;
         }
     }
 
@@ -502,8 +511,12 @@ fn import_openapi3(
     let paths = doc.get("paths").and_then(|v| v.as_object());
     let tags_info = extract_tags(doc);
     let now = now_iso();
-    let mut sort_order: i32 = 0;
-    let mut folder_cache: HashMap<String, String> = HashMap::new();
+    let mut ctx = ImportCtx {
+        sort_order: 0,
+        folder_cache: HashMap::new(),
+        // 一次建索引，后续查重走内存（避免逐条全表扫描 + 逐行解析 data_json）
+        index: menu_repo::build_menu_index(db, project_id)?,
+    };
 
     if let Some(paths_obj) = paths {
         for (path_str, path_item) in paths_obj {
@@ -546,8 +559,7 @@ fn import_openapi3(
                     operation,
                     &op_tags,
                     &tags_info,
-                    &mut sort_order,
-                    &mut folder_cache,
+                    &mut ctx,
                 )?;
 
                 upsert_api_detail(
@@ -565,8 +577,8 @@ fn import_openapi3(
                         request_body: build_openapi_request_body(operation),
                         responses: build_openapi_responses(operation),
                     },
-                    &mut sort_order,
                     &now,
+                    &mut ctx,
                 )?;
             }
         }
@@ -574,7 +586,7 @@ fn import_openapi3(
 
     // Import schemas/components from OpenAPI 3.x
     if let Some(schemas) = doc.get("components").and_then(|c| c.get("schemas")).and_then(|s| s.as_object()) {
-        import_schemas(db, project_id, schemas, &mut sort_order)?;
+        import_schemas(db, project_id, schemas, &mut ctx)?;
     }
 
     project_repo::get_project_state(db, project_id)
@@ -589,8 +601,12 @@ fn import_swagger2(
     let paths = doc.get("paths").and_then(|v| v.as_object());
     let tags_info = extract_tags(doc);
     let now = now_iso();
-    let mut sort_order: i32 = 0;
-    let mut folder_cache: HashMap<String, String> = HashMap::new();
+    let mut ctx = ImportCtx {
+        sort_order: 0,
+        folder_cache: HashMap::new(),
+        // 一次建索引，后续查重走内存（避免逐条全表扫描 + 逐行解析 data_json）
+        index: menu_repo::build_menu_index(db, project_id)?,
+    };
 
     if let Some(paths_obj) = paths {
         for (path_str, path_item) in paths_obj {
@@ -634,8 +650,7 @@ fn import_swagger2(
                     operation,
                     &op_tags,
                     &tags_info,
-                    &mut sort_order,
-                    &mut folder_cache,
+                    &mut ctx,
                 )?;
 
                 upsert_api_detail(
@@ -654,8 +669,8 @@ fn import_swagger2(
                         request_body: build_swagger2_request_body(doc, operation),
                         responses: build_openapi_responses(operation),
                     },
-                    &mut sort_order,
                     &now,
+                    &mut ctx,
                 )?;
             }
         }
@@ -663,7 +678,7 @@ fn import_swagger2(
 
     // Import schemas/definitions from Swagger 2.0
     if let Some(definitions) = doc.get("definitions").and_then(|d| d.as_object()) {
-        import_schemas(db, project_id, definitions, &mut sort_order)?;
+        import_schemas(db, project_id, definitions, &mut ctx)?;
     }
 
     project_repo::get_project_state(db, project_id)
@@ -701,31 +716,33 @@ fn import_schemas(
     db: &Db,
     project_id: &str,
     schemas: &serde_json::Map<String, Value>,
-    sort_order: &mut i32,
+    ctx: &mut ImportCtx,
 ) -> Result<(), AppError> {
     for (name, schema) in schemas {
         let data_json = serde_json::json!({
             "jsonSchema": schema,
         });
 
-        // 按名称幂等：同名模型覆盖内容，不重复新建
-        match menu_repo::find_menu_item_by_name(db, project_id, None, name, "apiSchema")? {
-            Some(item) => {
+        // 按名称幂等：同名模型覆盖内容，不重复新建（走索引，不逐条查库）
+        match ctx.index.menu_id(None, "apiSchema", name).map(str::to_string) {
+            Some(item_id) => {
                 let updates = serde_json::json!({ "name": name, "data": data_json });
-                menu_repo::update_menu_item(db, project_id, &item.id, &updates)?;
+                menu_repo::update_menu_item(db, project_id, &item_id, &updates)?;
             }
             None => {
+                let id = Uuid::new_v4().to_string();
+                ctx.index.remember_menu(None, "apiSchema", name, &id);
                 let payload = CreateMenuItemPayload {
-                    id: Uuid::new_v4().to_string(),
+                    id,
                     parent_id: None,
                     name: name.clone(),
                     menu_type: "apiSchema".to_string(),
                     data_json: Some(data_json),
                     run_tab_json: None,
-                    sort_order: Some(*sort_order),
+                    sort_order: Some(ctx.sort_order),
                 };
                 menu_repo::create_menu_item(db, project_id, &payload)?;
-                *sort_order += 1;
+                ctx.sort_order += 1;
             }
         }
     }
@@ -1089,5 +1106,66 @@ mod tests {
             .unwrap();
         assert_eq!(api.id, first_id, "同 method+path 应保留原 id");
         assert_eq!(api.name, "创建(更新)", "内容应被更新");
+    }
+
+    /// 计费用例（不参与常规测试）：对比「逐条查重」与「一次性索引」的耗时。
+    ///
+    /// cargo test --lib import_dedupe_cost -- --ignored --nocapture
+    ///
+    /// 断言只校验索引查得准；耗时仅打印 —— 时间断言在 CI 上必然不稳。
+    #[test]
+    #[ignore]
+    fn import_dedupe_cost() {
+        use std::time::Instant;
+
+        let db = test_db();
+        let n = 800;
+        for i in 0..n {
+            let payload = CreateMenuItemPayload {
+                id: format!("api-{i}"),
+                parent_id: None,
+                name: format!("api {i}"),
+                menu_type: "apiDetail".to_string(),
+                data_json: Some(json!({
+                    "method": "GET",
+                    "path": format!("/p/{i}"),
+                    "responses": [{
+                        "code": 200,
+                        "name": "成功",
+                        "jsonSchema": {
+                            "type": "object",
+                            "properties": {
+                                "a": { "type": "string" },
+                                "b": { "type": "integer" }
+                            }
+                        }
+                    }]
+                })),
+                run_tab_json: None,
+                sort_order: Some(i),
+            };
+            menu_repo::create_menu_item(&db, "p1", &payload).unwrap();
+        }
+
+        let t0 = Instant::now();
+        for i in 0..n {
+            let found =
+                menu_repo::find_api_by_path_method(&db, "p1", &format!("/p/{i}"), "GET").unwrap();
+            assert!(found.is_some());
+        }
+        let per_call = t0.elapsed();
+
+        let t1 = Instant::now();
+        let index = menu_repo::build_menu_index(&db, "p1").unwrap();
+        for i in 0..n {
+            assert!(index.api_entry("GET", &format!("/p/{i}")).is_some());
+        }
+        let indexed = t1.elapsed();
+
+        println!("N={n}  逐条查重 {per_call:?}  一次性索引 {indexed:?}");
+        assert_eq!(
+            index.api_entry("GET", "/p/0").map(|(id, _)| id.to_string()),
+            Some("api-0".to_string())
+        );
     }
 }

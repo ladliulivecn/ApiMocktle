@@ -1,4 +1,5 @@
 use rusqlite::{params, Connection, Transaction};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::db::client::Db;
@@ -484,29 +485,111 @@ pub fn find_api_by_path_method(
     let conn = db.0.lock().unwrap();
     let mut stmt = conn.prepare(
         "SELECT id, parent_id, name, type, data_json, run_tab_json, sort_order, created_at, updated_at
-         FROM menu_items WHERE project_id = ?1 AND type = ?2 ORDER BY sort_order",
+         FROM menu_items
+         WHERE project_id = ?1 AND type = 'apiDetail'
+           AND json_extract(data_json, '$.path') = ?2
+           AND upper(json_extract(data_json, '$.method')) = ?3
+         ORDER BY sort_order LIMIT 1",
     )?;
-    let rows = stmt.query_map(params![project_id, "apiDetail"], row_to_menu_data)?;
-    let wanted_method = method.to_uppercase();
+    let mut rows = stmt.query_map(
+        params![project_id, path, method.to_uppercase()],
+        row_to_menu_data,
+    )?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
+}
+
+/// 批量写入用的查重索引。
+///
+/// 逐条调 `find_api_by_path_method` 会让导入 N 条接口退化成 N 次全表扫描、
+/// 外加 N² 次 data_json 解析（data_json 含完整 schema，KB 级）。这里一次扫表、
+/// 在 SQL 层用 `json_extract` 取键，Rust 侧不解析 JSON，查询变成 HashMap 查找。
+#[derive(Default)]
+pub struct MenuIndex {
+    /// (METHOD 大写, path) → (菜单项 id, createdAt)
+    apis: HashMap<(String, String), (String, Option<String>)>,
+    /// (parent_id 或空串, 菜单类型, 名称) → 菜单项 id
+    by_name: HashMap<(String, String, String), String>,
+}
+
+fn name_key(parent_id: Option<&str>, menu_type: &str, name: &str) -> (String, String, String) {
+    (
+        parent_id.unwrap_or_default().to_string(),
+        menu_type.to_string(),
+        name.to_string(),
+    )
+}
+
+impl MenuIndex {
+    /// 查已存在的接口（大小写不敏感的 method）。
+    pub fn api_entry(&self, method: &str, path: &str) -> Option<(&str, Option<&str>)> {
+        self.apis
+            .get(&(method.to_uppercase(), path.to_string()))
+            .map(|(id, created_at)| (id.as_str(), created_at.as_deref()))
+    }
+
+    /// 查同级同名的目录 / 模型。
+    pub fn menu_id(&self, parent_id: Option<&str>, menu_type: &str, name: &str) -> Option<&str> {
+        self.by_name
+            .get(&name_key(parent_id, menu_type, name))
+            .map(String::as_str)
+    }
+
+    /// 新建接口后回写，保证同一份文档里重复的 method+path 也能命中。
+    pub fn remember_api(&mut self, method: &str, path: &str, id: &str, created_at: Option<&str>) {
+        self.apis
+            .entry((method.to_uppercase(), path.to_string()))
+            .or_insert_with(|| (id.to_string(), created_at.map(str::to_string)));
+    }
+
+    /// 新建目录 / 模型后回写。
+    pub fn remember_menu(&mut self, parent_id: Option<&str>, menu_type: &str, name: &str, id: &str) {
+        self.by_name
+            .entry(name_key(parent_id, menu_type, name))
+            .or_insert_with(|| id.to_string());
+    }
+}
+
+/// 一次扫描建立查重索引（同键保留 sort_order 最小的那条，与逐条查询语义一致）。
+pub fn build_menu_index(db: &Db, project_id: &str) -> Result<MenuIndex, crate::errors::AppError> {
+    let conn = db.0.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT id, COALESCE(parent_id, ''), name, type,
+                json_extract(data_json, '$.path')      AS path,
+                json_extract(data_json, '$.method')    AS method,
+                json_extract(data_json, '$.createdAt') AS created_at
+         FROM menu_items WHERE project_id = ?1 ORDER BY sort_order",
+    )?;
+    let rows = stmt.query_map(params![project_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+        ))
+    })?;
+
+    let mut index = MenuIndex::default();
     for row in rows {
-        let item = row?;
-        let Some(data) = item.data_json.as_ref() else {
-            continue;
-        };
-        if data.get("path").and_then(|v| v.as_str()).unwrap_or("") != path {
-            continue;
-        }
-        if data
-            .get("method")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_uppercase()
-            == wanted_method
-        {
-            return Ok(Some(item));
+        let (id, parent_id, name, menu_type, path, method, created_at) = row?;
+        index.remember_menu(
+            Some(parent_id.as_str()).filter(|s| !s.is_empty()),
+            &menu_type,
+            &name,
+            &id,
+        );
+        if menu_type == "apiDetail" {
+            if let (Some(path), Some(method)) = (path, method) {
+                index.remember_api(&method, &path, &id, created_at.as_deref());
+            }
         }
     }
-    Ok(None)
+    Ok(index)
 }
 
 /// 在指定父级下按名称查找指定类型的菜单项(导入器用于复用同名目录/模型)。
