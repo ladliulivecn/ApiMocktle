@@ -45,11 +45,15 @@ pub async fn start_mcp_server(
     }
 
     let preferred_port = port.unwrap_or(14203);
+    let host = app_config
+        .get("mcp_host")
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "0.0.0.0".to_string());
     let db_clone = db.inner().clone();
     let handle_clone = handle.inner().clone();
 
     tokio::spawn(async move {
-        crate::http::mcp_server::start_mcp_server(db_clone, handle_clone, preferred_port).await;
+        crate::http::mcp_server::start_mcp_server(db_clone, handle_clone, preferred_port, &host).await;
     });
 
     // Wait a bit for the server to start

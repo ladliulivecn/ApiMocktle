@@ -83,6 +83,8 @@ pub struct ToolResultContent {
 pub struct McpServerState {
     pub db: Arc<Db>,
     pub tools: Vec<ToolDefinition>,
+    /// 监听非回环地址时，连只读工具也要令牌 —— 否则局域网内任何人都能读项目与测试数据
+    pub require_auth: bool,
 }
 
 // ==================== MCP Server Handle ====================
@@ -1020,8 +1022,12 @@ fn doc_header_token(headers: &HeaderMap) -> Option<String> {
 }
 
 /// 只对 api-doc.* 校验令牌：api-test.* 维持原有的无鉴权行为，避免破坏现有用法。
-fn authorize_doc_tool(db: &Db, headers: &HeaderMap) -> Result<(), JsonRpcError> {
-    let Some(token) = doc_header_token(headers) else {
+/// 回环地址只有本机可达，不需要为读工具加令牌；绑到网卡上的地址就得全部鉴权
+fn requires_auth_for_host(host: &str) -> bool {
+    !matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+fn authorize_doc_tool(db: &Db, headers: &HeaderMap) -> Result<(), JsonRpcError> {    let Some(token) = doc_header_token(headers) else {
         return Err(doc_err(
             -32001,
             "api-doc.* 工具需要个人令牌：请在请求头带 X-YAPI-TOKEN 或 Authorization: Bearer <令牌>",
@@ -1060,6 +1066,27 @@ fn doc_normalize_param(raw: &serde_json::Value) -> serde_json::Value {
 
 /// parameters 按 path/query/header/cookie 分组；全空时存 null，与导入器一致。
 fn doc_normalize_parameters(raw: &serde_json::Value) -> serde_json::Value {
+    // 也接受扁平数组（每项带 in），否则调用方漏写分组会静默丢掉整批参数
+    if let Some(arr) = raw.as_array() {
+        let mut grouped: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        for item in arr {
+            let section = match item.get("in").and_then(|v| v.as_str()) {
+                Some(s @ ("path" | "query" | "header" | "cookie")) => s,
+                _ => "query",
+            };
+            grouped
+                .entry(section.to_string())
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+                .as_array_mut()
+                .expect("value is array")
+                .push(doc_normalize_param(item));
+        }
+        return if grouped.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::Object(grouped)
+        };
+    }
     let mut out = serde_json::Map::new();
     for section in ["path", "query", "header", "cookie"] {
         if let Some(arr) = raw.get(section).and_then(|v| v.as_array()) {
@@ -1077,8 +1104,14 @@ fn doc_normalize_parameters(raw: &serde_json::Value) -> serde_json::Value {
 }
 
 fn doc_normalize_request_body(raw: &serde_json::Value) -> serde_json::Value {
+    // contentType 是 Apifox/OpenAPI 的说法，库内字段叫 type，两种都认
+    let body_type = raw
+        .get("type")
+        .or_else(|| raw.get("contentType"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("none");
     let mut out = serde_json::json!({
-        "type": raw.get("type").and_then(|v| v.as_str()).unwrap_or("none"),
+        "type": body_type,
     });
     if let Some(params) = raw.get("parameters").and_then(|v| v.as_array()) {
         out["parameters"] =
@@ -1217,7 +1250,7 @@ fn doc_upsert_endpoint(
     };
 
     let parameters = match args.get("parameters") {
-        Some(v) if v.is_object() => doc_normalize_parameters(v),
+        Some(v) if v.is_object() || v.is_array() => doc_normalize_parameters(v),
         _ => prev
             .and_then(|v| v.get("parameters"))
             .cloned()
@@ -2834,8 +2867,8 @@ async fn handle_mcp_request(
         "tools/call" => {
             match serde_json::from_value::<ToolCallParams>(request.params.clone()) {
                 Ok(params) => {
-                    // 只有文档写工具要求个人令牌；api-test.* 维持原有无鉴权行为
-                    let auth = if params.name.starts_with(DOC_TOOL_PREFIX) {
+                    // 文档写工具始终要求个人令牌；绑非回环地址时全部工具都要
+                    let auth = if state.require_auth || params.name.starts_with(DOC_TOOL_PREFIX) {
                         authorize_doc_tool(&state.db, &headers)
                     } else {
                         Ok(())
@@ -2891,21 +2924,24 @@ async fn handle_mcp_request(
     Json(response).into_response()
 }
 
-pub async fn start_mcp_server(db: Arc<Db>, handle: Arc<McpServerHandle>, preferred_port: u16) {
+pub async fn start_mcp_server(db: Arc<Db>, handle: Arc<McpServerHandle>, preferred_port: u16, host: &str) {
+    // 绑 0.0.0.0 时局域网可达，令牌校验扩到全部工具（见 McpServerState::require_auth）
+    let require_auth = requires_auth_for_host(host);
     let state = Arc::new(McpServerState {
         db,
         tools: get_tool_definitions(),
+        require_auth,
     });
 
     let app = Router::new()
         .route("/", post(handle_mcp_request))
         .with_state(state);
 
-    let listener = match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", preferred_port)).await {
+    let listener = match tokio::net::TcpListener::bind(format!("{}:{}", host, preferred_port)).await {
         Ok(l) => l,
         Err(_) => {
             // Try random port
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("Failed to bind MCP server")
+            tokio::net::TcpListener::bind(format!("{}:0", host)).await.expect("Failed to bind MCP server")
         }
     };
 
@@ -2952,6 +2988,34 @@ mod tests {
     fn test_tool_definitions_count() {
         let tools = get_tool_definitions();
         assert_eq!(tools.len(), 25, "Expected 25 MCP tools, got {}", tools.len());
+    }
+
+    #[test]
+    fn doc_parameters_flat_array_is_grouped_by_in() {
+        let raw = serde_json::json!([
+            {"name": "id", "in": "path", "type": "integer", "required": true},
+            {"name": "page", "in": "query", "type": "integer"},
+            {"name": "X-Trace", "type": "string"}
+        ]);
+        let out = doc_normalize_parameters(&raw);
+        assert_eq!(out["path"].as_array().unwrap().len(), 1);
+        assert_eq!(out["query"].as_array().unwrap().len(), 2, "缺 in 的归 query");
+        assert!(out.get("header").is_none());
+    }
+
+    #[test]
+    fn doc_request_body_accepts_content_type_alias() {
+        let body = doc_normalize_request_body(&serde_json::json!({"contentType": "json"}));
+        assert_eq!(body["type"], "json");
+    }
+
+    #[test]
+    fn auth_required_only_for_non_loopback_host() {
+        assert!(!requires_auth_for_host("127.0.0.1"));
+        assert!(!requires_auth_for_host("localhost"));
+        assert!(!requires_auth_for_host("::1"));
+        assert!(requires_auth_for_host("0.0.0.0"));
+        assert!(requires_auth_for_host("192.168.1.10"));
     }
 
     #[test]
@@ -3444,7 +3508,7 @@ mod tests {
     #[tokio::test]
     async fn protocol_handles_ping_and_notifications() {
         let db = setup_db();
-        let state = Arc::new(McpServerState { db: db.clone(), tools: get_tool_definitions() });
+        let state = Arc::new(McpServerState { db: db.clone(), tools: get_tool_definitions(), require_auth: false });
         let req1 = JsonRpcRequest { jsonrpc: "2.0".to_string(), id: Some(serde_json::json!(1)), method: "ping".to_string(), params: serde_json::json!({}) };
         let resp1 = handle_mcp_request(AxumState(state.clone()), HeaderMap::new(), Json(req1)).await;
         let body1 = axum::body::to_bytes(resp1.into_body(), 1024 * 1024).await.unwrap();
@@ -3585,6 +3649,29 @@ mod tests {
         assert_eq!(data["requestBody"]["required"], serde_json::json!(true));
         assert_eq!(data["responses"].as_array().unwrap().len(), 2, "多响应必须保留");
         assert_eq!(data["responses"][1]["code"], 401);
+    }
+
+    #[test]
+    fn doc_upsert_accepts_flat_parameter_array() {
+        let db = setup_db();
+        let res = call_json(
+            &db,
+            "api-doc.upsert_endpoint",
+            serde_json::json!({
+                "projectId": "proj-1",
+                "method": "GET",
+                "path": "/api/v1/flat",
+                "name": "扁平参数",
+                "parameters": [
+                    {"name": "id", "in": "path", "type": "integer"},
+                    {"name": "q", "in": "query", "type": "string"}
+                ]
+            }),
+        );
+        let data = api_data(&db, res["id"].as_str().unwrap());
+        assert_eq!(data["parameters"]["path"][0]["name"], "id");
+        assert_eq!(data["parameters"]["path"][0]["type"], "integer");
+        assert_eq!(data["parameters"]["query"][0]["name"], "q");
     }
 
     #[test]
