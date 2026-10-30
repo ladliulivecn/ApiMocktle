@@ -798,15 +798,23 @@ fn detect_and_import(
         tx.commit()?;
     }
 
-    // 全局变量：原生导出的 environments 恒为空，只合并全局变量。
-    // save_project_environments 内部会取 db 锁，必须放在事务外调用。
+    // 全局变量与环境：Apifox 导出里 environments 恒为空（环境需另外取数注入），
+    // 全局变量只有部分项目有。save_project_environments 内部会取 db 锁，
+    // 必须放在事务外调用。
     if native {
-        let imported = import_native::native_global_variables(doc);
-        if !imported.is_empty() {
+        let variables = import_native::native_global_variables(doc);
+        let environments = import_native::native_environments(doc);
+        if !variables.is_empty() || !environments.is_empty() {
             let mut config =
                 project_repo::get_project_state(db, project_id)?.project_environment_config;
-            config.global_variables =
-                import_native::merge_global_variables(config.global_variables, imported);
+            if !variables.is_empty() {
+                config.global_variables =
+                    import_native::merge_global_variables(config.global_variables, variables);
+            }
+            if !environments.is_empty() {
+                config.environments =
+                    import_native::merge_environments(config.environments, environments);
+            }
             menu_repo::save_project_environments(db, project_id, &config)?;
         }
     }
@@ -1151,6 +1159,47 @@ mod tests {
             .unwrap();
         assert_eq!(api.id, first_id, "同 method+path 应保留原 id");
         assert_eq!(api.name, "创建(更新)", "内容应被更新");
+    }
+
+    /// 原生格式导入时，环境与全局变量一并写入 environmentConfig。
+    #[test]
+    fn native_import_writes_environments_and_global_variables() {
+        let db = test_db();
+        let doc = json!({
+            "apifoxProject": "1.0.0",
+            "info": { "name": "demo" },
+            "apiCollection": [{
+                "name": "根目录",
+                "id": 1,
+                "items": [{
+                    "name": "示例接口",
+                    "api": { "id": 100, "method": "get", "path": "/a", "responses": [] }
+                }]
+            }],
+            "schemaCollection": [],
+            "environments": [
+                {
+                    "id": 802349,
+                    "name": "test-php",
+                    "baseUrls": { "default": "https://manage-test.kaisaile.org" }
+                }
+            ],
+            "globalVariables": [
+                { "id": "g1", "variables": [{ "name": "restcore", "value": "/index.php/RestCore" }] }
+            ]
+        });
+
+        let state = import_api_document(&db, "p1", "json", &doc.to_string(), Some("src-a")).unwrap();
+        let config = &state.project_environment_config;
+
+        assert_eq!(config.environments.len(), 1, "环境应写入 environmentConfig");
+        assert_eq!(config.environments[0]["name"], "test-php");
+        assert_eq!(
+            config.environments[0]["url"],
+            "https://manage-test.kaisaile.org"
+        );
+        assert_eq!(config.global_variables.len(), 1, "全局变量应写入 environmentConfig");
+        assert_eq!(config.global_variables[0]["name"], "restcore");
     }
 
     /// 不同来源的同名接口 / 目录 / 模型互不覆盖（幂等键含来源维度）。

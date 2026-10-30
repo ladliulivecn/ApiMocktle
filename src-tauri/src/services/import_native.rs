@@ -789,6 +789,72 @@ impl<'a> NativeImport<'a> {
 ///
 /// 原生导出里 `environments` 恒为空数组（两种方向的导出都不含环境数据），
 /// 所以环境只能由 `apifox environment list` 单独取，本轮不导入。
+/// 提取原生文档里的环境列表，映射成 ApiMocktle 的 `ApiEnvironment`。
+///
+/// Apifox 的两种导出**都不含环境数据**（实测 `environments` 恒为空数组），
+/// 需要用 `apifox environment list` 单独取回后注入本字段，再走同一条导入路径。
+///
+/// 映射：Apifox `{id, name, baseUrls:{default}, parameters:{...}}`
+/// → ApiMocktle `{id, name, url, baseUrls:[{id,url}], variables, parameters}`
+pub(crate) fn native_environments(doc: &Value) -> Vec<Value> {
+    let Some(envs) = doc.get("environments").and_then(|v| v.as_array()) else {
+        return vec![];
+    };
+
+    envs
+        .iter()
+        .filter_map(|env| {
+            let name = env.get("name").and_then(|v| v.as_str())?;
+            let id = match env.get("id") {
+                Some(Value::String(s)) => s.clone(),
+                Some(v) => v.to_string(),
+                None => Uuid::new_v4().to_string(),
+            };
+            let base_urls = env.get("baseUrls").and_then(|v| v.as_object());
+            let default_url = base_urls
+                .and_then(|m| m.get("default"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let base_url_list: Vec<Value> = base_urls
+                .map(|m| {
+                    m.iter()
+                        .map(|(k, v)| json!({ "id": k, "url": v.as_str().unwrap_or("") }))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            Some(json!({
+                "id": id,
+                "name": name,
+                "url": default_url,
+                "baseUrls": base_url_list,
+                "variables": [],
+                "parameters": {
+                    "header": [],
+                    "cookie": [],
+                    "query": [],
+                    "body": []
+                }
+            }))
+        })
+        .collect()
+}
+
+/// 同名环境按新值替换，没有则追加。
+pub(crate) fn merge_environments(mut existing: Vec<Value>, imported: Vec<Value>) -> Vec<Value> {
+    for item in imported {
+        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        match existing
+            .iter_mut()
+            .find(|slot| slot.get("name").and_then(|v| v.as_str()) == Some(name))
+        {
+            Some(slot) => *slot = item,
+            None => existing.push(item),
+        }
+    }
+    existing
+}
+
 pub(crate) fn native_global_variables(doc: &Value) -> Vec<Value> {
     let Some(groups) = doc.get("globalVariables").and_then(|v| v.as_array()) else {
         return vec![];
@@ -841,6 +907,45 @@ pub(crate) fn merge_global_variables(mut existing: Vec<Value>, imported: Vec<Val
 
 #[cfg(test)]
 mod tests {
+    /// 环境映射：Apifox 环境 → ApiMocktle 的 ApiEnvironment。
+    #[test]
+    fn native_environments_are_mapped() {
+        let doc = json!({
+            "environments": [
+                {
+                    "id": 802349,
+                    "name": "test-php",
+                    "baseUrls": { "default": "https://manage-test.kaisaile.org" },
+                    "parameters": { "cookie": [], "query": [], "header": [], "body": [] }
+                },
+                { "id": 2741630, "name": "云端 Mock", "baseUrls": { "default": "" }, "parameters": {} }
+            ]
+        });
+
+        let envs = native_environments(&doc);
+        assert_eq!(envs.len(), 2);
+        assert_eq!(envs[0]["name"], "test-php");
+        assert_eq!(envs[0]["id"], "802349", "数字 id 应转成字符串");
+        assert_eq!(envs[0]["url"], "https://manage-test.kaisaile.org");
+        assert_eq!(envs[0]["baseUrls"][0]["url"], "https://manage-test.kaisaile.org");
+        assert_eq!(envs[1]["url"], "", "空 base url 也要保留环境");
+    }
+
+    /// 同名环境覆盖、不同名追加。
+    #[test]
+    fn merge_environments_replaces_by_name() {
+        let existing = vec![json!({ "id": "1", "name": "dev", "url": "https://old" })];
+        let imported = vec![
+            json!({ "id": "2", "name": "dev", "url": "https://new" }),
+            json!({ "id": "3", "name": "prod", "url": "https://prod" }),
+        ];
+
+        let merged = merge_environments(existing, imported);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0]["url"], "https://new", "同名环境应被新值替换");
+        assert_eq!(merged[1]["name"], "prod");
+    }
+
     use super::*;
     use crate::db::client::Db;
     use crate::db::project_repo;
