@@ -566,7 +566,7 @@ fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "api-doc.upsert_endpoint".to_string(),
-            description: "创建或更新接口文档。给了 id 按 id 更新；没给 id 时按 (projectId, method, path) 查重后更新，否则新建。幂等：同 (method, path) 再次调用更新同一条并保留原 id 与 createdAt。参数类型非法值降级 string，状态非法值降级 designing。删除接口请用 api-doc.delete_endpoint。".to_string(),
+            description: "创建或更新接口文档。给了 id 按 id 更新；没给 id 时按 (projectId, method, path) 查重后更新，否则新建。幂等：同 (method, path) 再次调用更新同一条并保留原 id 与 createdAt。参数类型非法值降级 string；状态非法值时沿用原状态（无有效原状态才用 designing）。parameters / requestBody / responses / tags 传入即整体替换该字段（类型不符等同未传），不传才沿用原值；只改描述或状态时不要传这几个字段，要传就必须带全量。删除接口请用 api-doc.delete_endpoint。".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -575,23 +575,25 @@ fn get_tool_definitions() -> Vec<ToolDefinition> {
                     "path": { "type": "string", "description": "接口路径，如 /api/v1/orders（必填）" },
                     "name": { "type": "string", "description": "接口名称（必填）" },
                     "description": { "type": "string", "description": "接口描述（可选，缺省保留原值）" },
-                    "status": { "type": "string", "description": "接口状态，取值 designing/pending/developing/obsolete/integrating/testing/tested/released/deprecated/exception，非法值降级 designing" },
-                    "tags": { "type": "array", "items": { "type": "string" }, "description": "标签（可选）" },
+                    "status": { "type": "string", "description": "接口状态，取值 designing/pending/developing/obsolete/integrating/testing/tested/released/deprecated/exception；非法值沿用原状态（无原状态才用 designing）" },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "标签（可选）。整体替换：传入即覆盖原有全部标签；不传才沿用原值" },
                     "parameters": {
-                        "type": "object",
-                        "description": "请求参数，按位置分组；每项 {name,type,required?,description?,example?,enable?}",
+                        "type": ["object", "array"],
+                        "description": "请求参数，按位置分组；每项 {name,type,required?,description?,example?,enable?}。整体替换：传入即覆盖原有全部参数（未列出的旧参数会消失）；不传才沿用原值。也接受扁平数组，每项用 in 标位置（path/query/header/cookie，缺省 query）",
                         "properties": {
                             "path": { "type": "array", "items": { "type": "object", "properties": { "name": { "type": "string" }, "type": { "type": "string", "description": "integer/number/boolean/string/array/file，非法值降级 string" }, "required": { "type": "boolean" }, "description": { "type": "string" }, "example": {}, "enable": { "type": "boolean" } } } },
                             "query": { "type": "array", "items": { "type": "object", "properties": { "name": { "type": "string" }, "type": { "type": "string", "description": "integer/number/boolean/string/array/file，非法值降级 string" }, "required": { "type": "boolean" }, "description": { "type": "string" }, "example": {}, "enable": { "type": "boolean" } } } },
                             "header": { "type": "array", "items": { "type": "object", "properties": { "name": { "type": "string" }, "type": { "type": "string", "description": "integer/number/boolean/string/array/file，非法值降级 string" }, "required": { "type": "boolean" }, "description": { "type": "string" }, "example": {}, "enable": { "type": "boolean" } } } },
                             "cookie": { "type": "array", "items": { "type": "object", "properties": { "name": { "type": "string" }, "type": { "type": "string", "description": "integer/number/boolean/string/array/file，非法值降级 string" }, "required": { "type": "boolean" }, "description": { "type": "string" }, "example": {}, "enable": { "type": "boolean" } } } }
-                        }
+                        },
+                        "items": { "type": "object", "properties": { "name": { "type": "string" }, "in": { "type": "string", "description": "位置：path/query/header/cookie，缺省 query" }, "type": { "type": "string", "description": "integer/number/boolean/string/array/file，非法值降级 string" }, "required": { "type": "boolean" }, "description": { "type": "string" }, "example": {}, "enable": { "type": "boolean" } } }
                     },
                     "requestBody": {
                         "type": "object",
-                        "description": "请求体 {type,parameters?,jsonSchema?,rawText?,required?,examples?}",
+                        "description": "请求体 {type,parameters?,jsonSchema?,rawText?,required?,examples?}。整体替换：传入即覆盖原有请求体；不传才沿用原值",
                         "properties": {
                             "type": { "type": "string", "description": "application/json 等媒体类型；无请求体用 none" },
+                            "contentType": { "type": "string", "description": "type 的别名，type 与 contentType 都不传按 none 处理" },
                             "parameters": { "type": "array", "items": { "type": "object", "properties": { "name": { "type": "string" }, "type": { "type": "string" }, "required": { "type": "boolean" }, "description": { "type": "string" }, "example": {}, "enable": { "type": "boolean" } } } },
                             "jsonSchema": {},
                             "rawText": { "type": "string" },
@@ -601,7 +603,7 @@ fn get_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "responses": {
                         "type": "array",
-                        "description": "响应列表；不传则新建时默认一条 200 成功，更新时保留原响应",
+                        "description": "响应列表；整体替换：传入即覆盖原有全部响应；不传则新建时默认一条 200 成功、更新时沿用原响应",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -614,7 +616,7 @@ fn get_tool_definitions() -> Vec<ToolDefinition> {
                             }
                         }
                     },
-                    "parentId": { "type": "string", "description": "挂到的接口目录 ID（可选，必须是 apiDetailFolder）" },
+                    "parentId": { "type": ["string", "null"], "description": "挂到的接口目录 ID（可选，必须是 apiDetailFolder）；不传则不改变位置，显式传 null 或空串表示移到根级" },
                     "id": { "type": "string", "description": "已有接口的菜单项 ID（可选，给了就按 id 更新）" }
                 },
                 "required": ["projectId", "method", "path", "name"]
@@ -3698,6 +3700,31 @@ mod tests {
         assert_eq!(data["responses"].as_array().unwrap().len(), 2);
         assert_eq!(data["parameters"]["query"][0]["name"], "page");
         assert_eq!(data["status"], "developing", "未给 status 时沿用原状态");
+    }
+
+    #[test]
+    fn doc_upsert_endpoint_replaces_parameters_when_provided() {
+        let db = setup_db();
+        let first = call_json(&db, "api-doc.upsert_endpoint", doc_upsert_args("新建订单"));
+        let id = first["id"].as_str().unwrap().to_string();
+
+        // 传入 parameters = 整体替换：只给 query 时，原 header 参数应消失
+        let mut args = doc_upsert_args("改名订单");
+        args["parameters"] = serde_json::json!({"query": [{"name": "size", "type": "integer"}]});
+        args["tags"] = serde_json::json!(["新标签"]);
+        let second = call_json(&db, "api-doc.upsert_endpoint", args);
+        assert_eq!(second["id"].as_str().unwrap(), id, "同 (method,path) 应更新同一条");
+
+        let data = api_data(&db, &id);
+        let query = data["parameters"]["query"].as_array().unwrap();
+        assert_eq!(query.len(), 1);
+        assert_eq!(query[0]["name"], "size");
+        assert!(
+            data["parameters"].get("header").is_none(),
+            "parameters 是整体替换而非合并，旧 header 参数不该残留: {}",
+            data["parameters"]
+        );
+        assert_eq!(data["tags"], serde_json::json!(["新标签"]), "tags 同样是整体替换");
     }
 
     #[test]
