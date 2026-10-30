@@ -37,7 +37,13 @@ export function ResponsePanel({ paramsArea, resultArea, hasResult, autoSaveId }:
   useEffect(() => {
     if (hasResult && !prevHasResultRef.current) {
       requestAnimationFrame(() => {
-        resultPanelRef.current?.resize(50)
+        const panel = resultPanelRef.current
+
+        if (!panel) { return }
+
+        // 结果区可能因历史布局被折叠成 0 高度（autoSaveId 会持久化拖拽比例），
+        // 结果到达时若不可见则展开，避免「恢复出结果但看不见」。
+        if (panel.getSize() < 15) { panel.resize(50) }
       })
     }
 

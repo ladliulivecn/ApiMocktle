@@ -44,34 +44,10 @@ import { buildJsoncBodyFillText } from './bodyJsonc'
 import { buildRequest, type BuildRequestResult } from './buildRequest'
 import { generateCurl } from './curl'
 import { collectEnvironmentBaseUrls, extractPathFromHistoryUrl, parseHistoryParams } from './historyUtils'
+import { cloneApiDetails, getRunTabStorageKey, mergeRunTabInfo, readLocalRunCopy, resolveInitialWorkCopy, writeLocalRunCopy } from './runTabState'
 import { executeScript } from './scripts'
 import { useApiRequestRunner } from './useApiRequestRunner'
 import { buildVarMaps, makeResolveVars, useResolvedVarMap } from './useResolvedVarMap'
-
-const STORAGE_PREFIX = 'run_tab_'
-
-function cloneApiDetails(source: ApiDetails): ApiDetails {
-  return JSON.parse(JSON.stringify(source)) as ApiDetails
-}
-
-function mergeRunTabInfo(docValue: ApiDetails, runTabInfo: RunTabInfo): ApiDetails {
-  const base = cloneApiDetails(docValue)
-  const hasBodyChanges = runTabInfo.bodyType !== undefined || runTabInfo.bodyParameters !== undefined || runTabInfo.bodyRawText !== undefined
-
-  return {
-    ...base,
-    parameters: runTabInfo.parameters ?? base.parameters,
-    requestBody: hasBodyChanges
-      ? {
-          type: runTabInfo.bodyType ?? base.requestBody?.type ?? 'none',
-          parameters: runTabInfo.bodyParameters ?? base.requestBody?.parameters,
-          rawText: runTabInfo.bodyRawText ?? base.requestBody?.rawText,
-        } as ApiRequestBody
-      : base.requestBody,
-    preScript: runTabInfo.preScript ?? base.preScript,
-    postScript: runTabInfo.postScript ?? base.postScript,
-  }
-}
 
 function buildBodyExample(apiDetails: ApiDetails, menuRawList?: unknown): string {
   const body = apiDetails.requestBody
@@ -156,7 +132,7 @@ export function RunTab() {
     }
   }, [menuRawList, tabData.key])
 
-  const storageKey = docValue ? `${STORAGE_PREFIX}${docValue.id}` : ''
+  const storageKey = docValue ? getRunTabStorageKey(docValue.id) : ''
 
   const { run, running, result, error, resetResult, setResult } = useApiRequestRunner()
 
@@ -178,17 +154,20 @@ export function RunTab() {
   // 缓存待解析的历史数据
   const pendingHistoryRef = useRef<{ requestJson: SavedRequestConfig, responseJson: ApiRunResult } | null>(null)
 
+  // 文档版本（菜单行 updatedAt）：用于判断本地副本是否过期
+  const menuUpdatedAt = (menuApiItem as { updatedAt?: string } | undefined)?.updatedAt
+  // persist 在回调里读取最新版本戳，避免把它放进依赖数组导致回调频繁重建
+  const docUpdatedAtRef = useRef<string | undefined>(menuUpdatedAt)
+
   const [workCopy, setWorkCopy] = useState<ApiDetails | undefined>(() => {
     if (!docValue) { return undefined }
 
-    try {
-      const saved = localStorage.getItem(storageKey)
-
-      if (saved) { return JSON.parse(saved) as ApiDetails }
-    }
-    catch { /* ignore */ }
-
-    return cloneApiDetails(docValue)
+    return resolveInitialWorkCopy({
+      docValue,
+      savedRunTabInfo,
+      localCopy: readLocalRunCopy(storageKey),
+      docUpdatedAt: menuUpdatedAt,
+    })
   })
 
   const [insecureSkipVerify, setInsecureSkipVerify] = useState(false)
@@ -242,51 +221,42 @@ export function RunTab() {
   const [, setPreScriptRunning] = useState(false)
   const [, setPostScriptRunning] = useState(false)
 
-  // 用数据库表列的 updatedAt 追踪文档版本（data_json 内部 updatedAt 不会随保存变化）
-  const docVersionRef = useRef((menuApiItem as { updatedAt?: string } | undefined)?.updatedAt)
+  // 按「文档版本」初始化 workCopy：同一版本只初始化一次，结果与菜单数据到达时机无关。
+  // 版本变化（文档被保存）时才重置并清空旧结果；首帧 docValue 晚到时不清空，
+  // 以免把刚恢复的历史结果又清掉。
+  const initVersionRef = useRef<string | undefined>(
+    docValue ? `${docValue.id}@${menuUpdatedAt ?? ''}` : undefined,
+  )
+  // savedRunTabInfo 每次菜单合并都是新对象，放进依赖数组会反复触发，改用 ref 读取最新值
+  const savedRunTabInfoRef = useRef(savedRunTabInfo)
+  savedRunTabInfoRef.current = savedRunTabInfo
 
   useEffect(() => {
     if (!docValue) { return }
 
-    const menuUpdatedAt = (menuApiItem as { updatedAt?: string } | undefined)?.updatedAt
+    const version = `${docValue.id}@${menuUpdatedAt ?? ''}`
 
-    // 文档有更新时，重新从文档初始化 workCopy
-    if (menuUpdatedAt && menuUpdatedAt !== docVersionRef.current) {
-      docVersionRef.current = menuUpdatedAt
-      originalDocRef.current = cloneApiDetails(docValue)
-      const merged = savedRunTabInfo ? mergeRunTabInfo(docValue, savedRunTabInfo) : cloneApiDetails(docValue)
-      setWorkCopy(merged)
-      resetResult()
+    if (initVersionRef.current === version) { return }
 
-      return
-    }
+    const isFirstInit = initVersionRef.current === undefined
 
-    // 首次加载：有本地副本则恢复，否则从文档初始化（合并 runTabInfo）
-    if (docVersionRef.current === undefined) {
-      docVersionRef.current = menuUpdatedAt
+    initVersionRef.current = version
+    docUpdatedAtRef.current = menuUpdatedAt
+    originalDocRef.current = cloneApiDetails(docValue)
+    setWorkCopy(resolveInitialWorkCopy({
+      docValue,
+      savedRunTabInfo: savedRunTabInfoRef.current,
+      localCopy: readLocalRunCopy(storageKey),
+      docUpdatedAt: menuUpdatedAt,
+    }))
 
-      try {
-        const saved = localStorage.getItem(`${STORAGE_PREFIX}${docValue.id}`)
-
-        if (saved) {
-          setWorkCopy(JSON.parse(saved) as ApiDetails)
-
-          return
-        }
-      }
-      catch { /* ignore */ }
-
-      const merged = savedRunTabInfo ? mergeRunTabInfo(docValue, savedRunTabInfo) : cloneApiDetails(docValue)
-      setWorkCopy(merged)
-      resetResult()
-    }
-  }, [(menuApiItem as { updatedAt?: string } | undefined)?.updatedAt])
+    if (!isFirstInit) { resetResult() }
+  }, [docValue, menuUpdatedAt, storageKey, resetResult])
 
   const persist = useCallback((copy: ApiDetails) => {
     if (!copy?.id) { return }
 
-    try { localStorage.setItem(`${STORAGE_PREFIX}${copy.id}`, JSON.stringify(copy)) }
-    catch { /* ignore */ }
+    writeLocalRunCopy(getRunTabStorageKey(copy.id), docUpdatedAtRef.current, copy)
   }, [])
 
   // 当前环境
@@ -401,7 +371,9 @@ export function RunTab() {
     void loadLastResult()
   }, [tabData.key, projectId, sessionId, setResult])
 
-  // 当 workCopy 可用时，恢复历史参数（直接写入 workCopy）
+  // 当 workCopy 可用时，用历史记录「只填补空白」：
+  // 本地副本已能恢复用户上次编辑的模板（含 {{var}}），历史里是变量已解析的文本，
+  // 直接覆盖属于数据降级，因此仅对当前为空的段落做兜底填充。
   useEffect(() => {
     if (!workCopy || !pendingHistoryRef.current) { return }
 
@@ -411,29 +383,36 @@ export function RunTab() {
       last.requestJson.url ?? '',
     )
 
-    const next = {
+    const isBlank = (list: { name?: string, enable?: boolean }[] | undefined) =>
+      !(list ?? []).some((p) => p.name && p.enable !== false)
+
+    const currentParams = workCopy.parameters ?? {}
+    const next: ApiDetails = {
       ...workCopy,
       parameters: {
-        ...workCopy.parameters,
-        query: parsed.query,
-        header: parsed.header,
-        cookie: parsed.cookie,
+        ...currentParams,
+        query: isBlank(currentParams.query) && parsed.query.length > 0 ? parsed.query : currentParams.query,
+        header: isBlank(currentParams.header) && parsed.header.length > 0 ? parsed.header : currentParams.header,
+        cookie: isBlank(currentParams.cookie) && parsed.cookie.length > 0 ? parsed.cookie : currentParams.cookie,
       },
     }
 
-    // Body type 和 rawText 恢复
-    if (last.requestJson.body && workCopy.requestBody) {
-      next.requestBody = {
-        ...next.requestBody!,
-        type: last.requestJson.contentType === 'application/json' ? BodyType.Json : BodyType.Raw,
-        rawText: last.requestJson.body,
-      }
+    // Body：仅当当前没有内容、且历史有 body 时填充；文档未定义 requestBody 时按 contentType 创建
+    const historyBody = last.requestJson.body
+    const currentRawText = workCopy.requestBody?.rawText
+
+    if (historyBody && !currentRawText?.trim()) {
+      const historyBodyType = last.requestJson.contentType === 'application/json' ? BodyType.Json : BodyType.Raw
+
+      next.requestBody = workCopy.requestBody
+        ? { ...workCopy.requestBody, type: historyBodyType, rawText: historyBody }
+        : ({ type: historyBodyType, rawText: historyBody } as ApiRequestBody)
     }
 
     setWorkCopy(next)
     persist(next)
     pendingHistoryRef.current = null
-  }, [workCopy, historyLoaded])
+  }, [workCopy, historyLoaded, persist])
 
   // 运行
   const handleRun = async () => {
@@ -600,7 +579,7 @@ export function RunTab() {
       : buildBodyFillText(workCopy, menuRawList)
     const next = {
       ...workCopy,
-      requestBody: { ...workCopy.requestBody!, rawText: text },
+      requestBody: { ...(workCopy.requestBody ?? { type: BodyType.None }), rawText: text },
     }
     setWorkCopy(next)
     persist(next)
@@ -982,7 +961,10 @@ export function RunTab() {
                     onBodyRawTextChange={(text) => {
                       const next = {
                         ...workCopy,
-                        requestBody: { ...workCopy.requestBody!, rawText: text },
+                        requestBody: {
+                          ...(workCopy.requestBody ?? { type: BodyType.None }),
+                          rawText: text,
+                        },
                       }
                       setWorkCopy(next)
                       persist(next)
@@ -1002,7 +984,11 @@ export function RunTab() {
                       const nextText = type === oldType ? oldText : bodyTextsRef.current[type]
                       const next = {
                         ...workCopy,
-                        requestBody: { ...workCopy.requestBody!, type, rawText: nextText },
+                        requestBody: {
+                          ...(workCopy.requestBody ?? { type: BodyType.None }),
+                          type,
+                          rawText: nextText,
+                        },
                       }
                       setWorkCopy(next)
                       persist(next)

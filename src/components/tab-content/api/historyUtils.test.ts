@@ -22,8 +22,17 @@ describe('extractPathFromHistoryUrl', () => {
     expect(extractPathFromHistoryUrl('https://DEV.a.com/users', ['https://dev.a.com/'])).toBe('/users')
   })
 
-  it('未命中任何环境时只保留 pathname', () => {
-    expect(extractPathFromHistoryUrl('https://third.com/api/x?y=1', ['https://dev.a.com'])).toBe('/api/x')
+  it('未命中任何环境时保留 origin 与路径', () => {
+    expect(extractPathFromHistoryUrl('https://third.com/api/x?y=1', ['https://dev.a.com'])).toBe('https://third.com/api/x')
+    expect(extractPathFromHistoryUrl('https://third.com/api/x', [])).toBe('https://third.com/api/x')
+  })
+
+  it('未命中时保留端口并丢弃 hash', () => {
+    expect(extractPathFromHistoryUrl('http://localhost:8080/api/users?page=1#top', [])).toBe('http://localhost:8080/api/users')
+  })
+
+  it('未命中且无路径时补根路径', () => {
+    expect(extractPathFromHistoryUrl('https://third.com', ['https://dev.a.com'])).toBe('https://third.com/')
   })
 
   it('历史为相对路径时去掉 query 与 hash', () => {
