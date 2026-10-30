@@ -592,30 +592,6 @@ pub fn build_menu_index(db: &Db, project_id: &str) -> Result<MenuIndex, crate::e
     Ok(index)
 }
 
-/// 在指定父级下按名称查找指定类型的菜单项(导入器用于复用同名目录/模型)。
-pub fn find_menu_item_by_name(
-    db: &Db,
-    project_id: &str,
-    parent_id: Option<&str>,
-    name: &str,
-    menu_type: &str,
-) -> Result<Option<ApiMenuData>, crate::errors::AppError> {
-    let conn = db.0.lock().unwrap();
-    let mut stmt = conn.prepare(
-        "SELECT id, parent_id, name, type, data_json, run_tab_json, sort_order, created_at, updated_at
-         FROM menu_items WHERE project_id = ?1 AND type = ?2 AND parent_id IS ?3 AND name = ?4
-         ORDER BY sort_order LIMIT 1",
-    )?;
-    let mut rows = stmt.query_map(
-        params![project_id, menu_type, parent_id, name],
-        row_to_menu_data,
-    )?;
-    match rows.next() {
-        Some(row) => Ok(Some(row?)),
-        None => Ok(None),
-    }
-}
-
 pub fn get_max_sort_order(
     db: &Db,
     project_id: &str,
