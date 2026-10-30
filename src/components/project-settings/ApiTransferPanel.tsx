@@ -269,10 +269,13 @@ export function ApiTransferPanel() {
           ? 'json'
           : 'auto'
 
+      // 来源标识 = 文件名（不含扩展名）：不同来源的同名接口 / 目录 / 模型互不覆盖
+      const source = file.name.replace(/\.[^.]+$/, '')
+
       const payload = await api<{ imported: { format: string }, state?: ProjectStateSnapshot }>('import_api_document', {
         sessionId,
         projectId,
-        payload: { format, content },
+        payload: { format, content, source },
       })
 
       if (payload.state) {
@@ -384,10 +387,13 @@ export function ApiTransferPanel() {
 
       const content = await response.text()
 
+      // 链接导入：用链接本身当来源标识，避免与其它来源的同名接口互相覆盖
+      const source = trimmed
+
       const payload = await api<{ imported: { format: string }, state?: ProjectStateSnapshot }>('import_api_document', {
         sessionId,
         projectId,
-        payload: { format: 'auto', content },
+        payload: { format: 'auto', content, source },
       })
 
       if (payload.state) {

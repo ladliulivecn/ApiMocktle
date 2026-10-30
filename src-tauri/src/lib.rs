@@ -34,10 +34,10 @@ pub fn run() {
             db::dynamic_variables_repo::ensure_seed(&db).ok();
             services::dynamic_variables::refresh_defs(&db).ok();
             let db_http = db.clone();
+            let db_mcp = db.clone();
             app.manage(db);
 
             let app_config = Arc::new(AppConfigService::new(&app_data_dir));
-            app.manage(app_config);
 
             // Start YApi HTTP server for EasyAPI plugin
             let yapi_handle = Arc::new(http::yapi_server::YApiServerHandle::new());
@@ -50,7 +50,33 @@ pub fn run() {
 
             // MCP Server handle
             let mcp_handle = Arc::new(http::mcp_server::McpServerHandle::new());
-            app.manage(mcp_handle);
+            app.manage(mcp_handle.clone());
+
+            // MCP 上次是被手动打开的就自动拉起：它是 agent 写文档的入口，
+            // 每次开程序都要手动点一次太别扭。
+            let mcp_auto_start = app_config
+                .get("mcp_auto_start")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if mcp_auto_start {
+                let port = app_config
+                    .get("mcp_port")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(14203) as u16;
+                // 默认 0.0.0.0：WSL / 局域网里的 agent 走宿主 IP 连不了回环地址。
+                // 绑非回环时 MCP 全部工具都要求个人令牌（见 McpServerState::require_auth）。
+                let host = app_config
+                    .get("mcp_host")
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_else(|| "0.0.0.0".to_string());
+                let db_mcp = db_mcp.clone();
+                let handle_mcp = mcp_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    http::mcp_server::start_mcp_server(db_mcp, handle_mcp, port, &host).await;
+                });
+            }
+
+            app.manage(app_config);
 
             // Share Server handle（不自动启动，由前端命令启动）
             let share_handle = Arc::new(http::share_server::ShareServerHandle::new());
