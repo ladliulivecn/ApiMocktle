@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::{
+    body::Bytes,
     extract::{Query, State},
     http::HeaderMap,
     response::Json,
@@ -202,6 +203,58 @@ fn build_yapi_from_save_body(body: &Value) -> YApiInterface {
         req_body_examples: serde_json::from_value(body.get("req_body_examples").cloned().unwrap_or(Value::Null)).ok(),
         operation_id: body.get("operationId").and_then(|v| v.as_str()).map(|s| s.to_string()),
     }
+}
+
+/// 解析 YApi 客户端的请求体。
+///
+/// 兼容三种形状：
+/// 1. JSON body，接口字段平铺在顶层（当前实现支持的形状）
+/// 2. JSON body，接口定义包在 `api_data`（JSON 字符串）里 —— Apifox 的同步工具用这种
+/// 3. `application/x-www-form-urlencoded` body（YApi 客户端常见），同样可能带 `api_data`
+///
+/// `api_data` 里的字段优先于顶层同名字段。
+fn parse_yapi_body(headers: &HeaderMap, body: &[u8]) -> Result<Value, String> {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let mut obj: serde_json::Map<String, Value> = if content_type
+        .contains("application/x-www-form-urlencoded")
+    {
+        let text = String::from_utf8_lossy(body);
+        let mut map = serde_json::Map::new();
+        for pair in text.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            let key = urlencoding::decode(k).map(|s| s.into_owned()).unwrap_or_else(|_| k.to_string());
+            let val = urlencoding::decode(v).map(|s| s.into_owned()).unwrap_or_else(|_| v.to_string());
+            map.insert(key, Value::String(val));
+        }
+        map
+    } else {
+        match serde_json::from_slice::<Value>(body) {
+            Ok(Value::Object(map)) => map,
+            Ok(_) => return Err("请求体必须是 JSON 对象".into()),
+            Err(e) => return Err(format!("JSON 解析失败: {e}")),
+        }
+    };
+
+    // api_data：内嵌的接口定义，优先于顶层同名字段
+    if let Some(api_data) = obj.get("api_data").and_then(|v| v.as_str()) {
+        let decoded = urlencoding::decode(api_data)
+            .map(|s| s.into_owned())
+            .unwrap_or_else(|_| api_data.to_string());
+        if let Ok(Value::Object(inner)) = serde_json::from_str::<Value>(&decoded) {
+            for (k, v) in inner {
+                obj.insert(k, v);
+            }
+        }
+    }
+
+    Ok(Value::Object(obj))
 }
 
 fn qtoken(query: &HashMap<String, String>) -> Option<&str> {
@@ -517,8 +570,12 @@ async fn handle_interface_save(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
-    Json(body): Json<Value>,
+    body: Bytes,
 ) -> Json<Value> {
+    let body = match parse_yapi_body(&headers, &body) {
+        Ok(v) => v,
+        Err(e) => return yapi_error(&e),
+    };
     let body_token = body.get("token").and_then(|v| v.as_str());
     let user_id = match resolve_user_id(&state, &headers, qtoken(&query), body_token) {
         Some(id) => id,
@@ -608,8 +665,12 @@ async fn handle_interface_up(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
-    Json(body): Json<Value>,
+    body: Bytes,
 ) -> Json<Value> {
+    let body = match parse_yapi_body(&headers, &body) {
+        Ok(v) => v,
+        Err(e) => return yapi_error(&e),
+    };
     let body_token = body.get("token").and_then(|v| v.as_str());
     let user_id = match resolve_user_id(&state, &headers, qtoken(&query), body_token) {
         Some(id) => id,
@@ -806,6 +867,8 @@ fn build_router(db: Arc<Db>, app_handle: Option<tauri::AppHandle>) -> Router {
         .route("/api/interface/up", post(handle_interface_up))
         .route("/api/interface/add_cat", post(handle_add_cat))
         .route("/api/interface/update_cat", post(handle_update_cat))
+        // YApi 标准协议的改目录路由名是 up_cat（update_cat 是本实现的扩展名）
+        .route("/api/interface/up_cat", post(handle_update_cat))
         .route("/api/interface/del_cat", post(handle_del_cat))
         .route("/api/interface/del", post(handle_del))
         .with_state(state)
@@ -813,6 +876,40 @@ fn build_router(db: Arc<Db>, app_handle: Option<tauri::AppHandle>) -> Router {
 
 
 
+#[cfg(test)]
+mod body_compat_tests {
+    use super::*;
+
+    /// YApi 客户端的三种请求体形状都要能解析：
+    /// 平铺 JSON、api_data 包裹的 JSON、form-urlencoded。
+    #[test]
+    fn parse_yapi_body_supports_three_shapes() {
+        let mut headers = HeaderMap::new();
+
+        // 1) 平铺 JSON
+        let body = parse_yapi_body(&headers, br#"{"title":"A","path":"/a","method":"GET"}"#).unwrap();
+        assert_eq!(body["title"], "A");
+
+        // 2) api_data 包裹（Apifox 同步工具的形状）
+        let inner = r#"{"title":"B","path":"/b","method":"POST"}"#;
+        let payload = format!(r#"{{"token":"t","api_data":{}}}"#, serde_json::to_string(inner).unwrap());
+        let body = parse_yapi_body(&headers, payload.as_bytes()).unwrap();
+        assert_eq!(body["title"], "B");
+        assert_eq!(body["method"], "POST");
+        assert_eq!(body["token"], "t");
+
+        // 3) form-urlencoded（api_data 需再做一次 percent 解码）
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        let encoded = urlencoding::encode(inner);
+        let payload = format!("token=t&api_data={encoded}");
+        let body = parse_yapi_body(&headers, payload.as_bytes()).unwrap();
+        assert_eq!(body["title"], "B");
+        assert_eq!(body["path"], "/b");
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
