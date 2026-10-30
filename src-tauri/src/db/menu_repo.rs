@@ -260,6 +260,28 @@ fn load_move_row(
     })
 }
 
+/// 把菜单项移动到指定父级（None = 根级），追加到同级末尾。
+///
+/// `update_menu_item_conn` 只能写字符串 parentId，移回根级需要单独一条路径。
+pub fn set_menu_item_parent(
+    conn: &Connection,
+    project_id: &str,
+    menu_id: &str,
+    parent_id: Option<&str>,
+) -> Result<(), crate::errors::AppError> {
+    let max_order: i32 = conn.query_row(
+        "SELECT COALESCE(MAX(sort_order), -1) FROM menu_items WHERE project_id = ?1 AND parent_id IS ?2",
+        params![project_id, parent_id],
+        |row| row.get(0),
+    )?;
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE menu_items SET parent_id = ?1, sort_order = ?2, updated_at = ?3 WHERE project_id = ?4 AND id = ?5",
+        params![parent_id, max_order + 1, now, project_id, menu_id],
+    )?;
+    Ok(())
+}
+
 /// 判断 candidate_id 是否位于 ancestor_id 的子树内(不含自身)。
 pub fn is_descendant_of(
     conn: &Connection,
