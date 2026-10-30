@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use rusqlite::Connection;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -331,6 +332,8 @@ fn split_folder_path(folder: &str) -> Vec<String> {
 /// 「谁负责改什么」。
 struct ImportCtx {
     sort_order: i32,
+    /// 来源标识（文件名 / 上游项目名），参与幂等键：不同来源互不覆盖
+    source: String,
     /// 目录全路径 → 目录 id，避免同一条路径反复解析
     folder_cache: HashMap<String, String>,
     /// 一次性建立的查重索引
@@ -338,7 +341,7 @@ struct ImportCtx {
 }
 
 fn ensure_folder_path(
-    db: &Db,
+    conn: &Connection,
     project_id: &str,
     segments: &[String],
     description: &str,
@@ -358,9 +361,10 @@ fn ensure_folder_path(
             continue;
         }
 
+        let source = ctx.source.clone();
         let folder_id = match ctx
             .index
-            .menu_id(parent_id.as_deref(), "apiDetailFolder", segment)
+            .menu_id(&source, parent_id.as_deref(), "apiDetailFolder", segment)
             .map(str::to_string)
         {
             Some(id) => id,
@@ -374,17 +378,23 @@ fn ensure_folder_path(
                     data_json: Some(serde_json::json!({
                         "name": segment,
                         "description": description,
+                        "source": source,
                     })),
                     run_tab_json: None,
                     sort_order: Some(ctx.sort_order),
                 };
-                menu_repo::create_menu_item(db, project_id, &payload)?;
+                menu_repo::create_menu_item_conn(conn, project_id, &payload)?;
                 ctx.sort_order += 1;
                 id
             }
         };
-        ctx.index
-            .remember_menu(parent_id.as_deref(), "apiDetailFolder", segment, &folder_id);
+        ctx.index.remember_menu(
+            &source,
+            parent_id.as_deref(),
+            "apiDetailFolder",
+            segment,
+            &folder_id,
+        );
         ctx.folder_cache.insert(key.clone(), folder_id.clone());
         parent_id = Some(folder_id);
     }
@@ -394,7 +404,7 @@ fn ensure_folder_path(
 
 /// 解析接口归属目录：优先 `x-apifox-folder`，其次第一个 tag（两者都可能是 `A/B/C`）。
 fn resolve_parent_folder(
-    db: &Db,
+    conn: &Connection,
     project_id: &str,
     operation: &Value,
     op_tags: &[String],
@@ -415,7 +425,7 @@ fn resolve_parent_folder(
         .map(|t| t.description.clone())
         .unwrap_or_default();
     ensure_folder_path(
-        db,
+        conn,
         project_id,
         &split_folder_path(&folder_path),
         &description,
@@ -439,16 +449,17 @@ struct ImportedApi<'a> {
 
 /// 按 method + path 幂等写入接口：命中则覆盖内容并保留原 id / createdAt，未命中才新建。
 fn upsert_api_detail(
-    db: &Db,
+    conn: &Connection,
     project_id: &str,
     api: ImportedApi<'_>,
     now: &str,
     ctx: &mut ImportCtx,
 ) -> Result<(), AppError> {
     // 查重走一次性建立的索引，不再每条全表扫描 + 解析 data_json
+    let source = ctx.source.clone();
     let existing = ctx
         .index
-        .api_entry(api.method, api.path)
+        .api_entry(&source, api.method, api.path)
         .map(|(id, created_at)| (id.to_string(), created_at.map(str::to_string)));
     let (api_id, created_at) = match &existing {
         Some((id, created_at)) => (
@@ -471,6 +482,7 @@ fn upsert_api_detail(
         "responses": api.responses,
         "createdAt": created_at,
         "updatedAt": now,
+        "source": source,
     });
 
     match existing {
@@ -480,11 +492,11 @@ fn upsert_api_detail(
             if api.parent_id.is_some() {
                 updates["parentId"] = serde_json::json!(api.parent_id);
             }
-            menu_repo::update_menu_item(db, project_id, &item_id, &updates)?;
+            menu_repo::update_menu_item_conn(conn, project_id, &item_id, &updates)?;
         }
         None => {
             ctx.index
-                .remember_api(api.method, api.path, &api_id, Some(now));
+                .remember_api(&source, api.method, api.path, &api_id, Some(now));
             let payload = CreateMenuItemPayload {
                 id: api_id,
                 parent_id: api.parent_id,
@@ -494,7 +506,7 @@ fn upsert_api_detail(
                 run_tab_json: None,
                 sort_order: Some(ctx.sort_order),
             };
-            menu_repo::create_menu_item(db, project_id, &payload)?;
+            menu_repo::create_menu_item_conn(conn, project_id, &payload)?;
             ctx.sort_order += 1;
         }
     }
@@ -504,19 +516,14 @@ fn upsert_api_detail(
 
 /// Import an OpenAPI 3.x document
 fn import_openapi3(
-    db: &Db,
+    conn: &Connection,
     project_id: &str,
     doc: &Value,
-) -> Result<ProjectStateSnapshot, AppError> {
+    ctx: &mut ImportCtx,
+) -> Result<(), AppError> {
     let paths = doc.get("paths").and_then(|v| v.as_object());
     let tags_info = extract_tags(doc);
     let now = now_iso();
-    let mut ctx = ImportCtx {
-        sort_order: 0,
-        folder_cache: HashMap::new(),
-        // 一次建索引，后续查重走内存（避免逐条全表扫描 + 逐行解析 data_json）
-        index: menu_repo::build_menu_index(db, project_id)?,
-    };
 
     if let Some(paths_obj) = paths {
         for (path_str, path_item) in paths_obj {
@@ -554,16 +561,16 @@ fn import_openapi3(
                     .unwrap_or_default();
 
                 let parent_id = resolve_parent_folder(
-                    db,
+                    conn,
                     project_id,
                     operation,
                     &op_tags,
                     &tags_info,
-                    &mut ctx,
+                    ctx,
                 )?;
 
                 upsert_api_detail(
-                    db,
+                    conn,
                     project_id,
                     ImportedApi {
                         path: path_str,
@@ -578,7 +585,7 @@ fn import_openapi3(
                         responses: build_openapi_responses(operation),
                     },
                     &now,
-                    &mut ctx,
+                    ctx,
                 )?;
             }
         }
@@ -586,27 +593,22 @@ fn import_openapi3(
 
     // Import schemas/components from OpenAPI 3.x
     if let Some(schemas) = doc.get("components").and_then(|c| c.get("schemas")).and_then(|s| s.as_object()) {
-        import_schemas(db, project_id, schemas, &mut ctx)?;
+        import_schemas(conn, project_id, schemas, ctx)?;
     }
 
-    project_repo::get_project_state(db, project_id)
+    Ok(())
 }
 
 /// Import a Swagger 2.0 document
 fn import_swagger2(
-    db: &Db,
+    conn: &Connection,
     project_id: &str,
     doc: &Value,
-) -> Result<ProjectStateSnapshot, AppError> {
+    ctx: &mut ImportCtx,
+) -> Result<(), AppError> {
     let paths = doc.get("paths").and_then(|v| v.as_object());
     let tags_info = extract_tags(doc);
     let now = now_iso();
-    let mut ctx = ImportCtx {
-        sort_order: 0,
-        folder_cache: HashMap::new(),
-        // 一次建索引，后续查重走内存（避免逐条全表扫描 + 逐行解析 data_json）
-        index: menu_repo::build_menu_index(db, project_id)?,
-    };
 
     if let Some(paths_obj) = paths {
         for (path_str, path_item) in paths_obj {
@@ -645,16 +647,16 @@ fn import_swagger2(
                     .unwrap_or_default();
 
                 let parent_id = resolve_parent_folder(
-                    db,
+                    conn,
                     project_id,
                     operation,
                     &op_tags,
                     &tags_info,
-                    &mut ctx,
+                    ctx,
                 )?;
 
                 upsert_api_detail(
-                    db,
+                    conn,
                     project_id,
                     ImportedApi {
                         path: path_str,
@@ -670,7 +672,7 @@ fn import_swagger2(
                         responses: build_openapi_responses(operation),
                     },
                     &now,
-                    &mut ctx,
+                    ctx,
                 )?;
             }
         }
@@ -678,10 +680,10 @@ fn import_swagger2(
 
     // Import schemas/definitions from Swagger 2.0
     if let Some(definitions) = doc.get("definitions").and_then(|d| d.as_object()) {
-        import_schemas(db, project_id, definitions, &mut ctx)?;
+        import_schemas(conn, project_id, definitions, ctx)?;
     }
 
-    project_repo::get_project_state(db, project_id)
+    Ok(())
 }
 
 fn build_swagger2_request_body(doc: &Value, operation: &Value) -> Value {
@@ -713,7 +715,7 @@ fn build_swagger2_request_body(doc: &Value, operation: &Value) -> Value {
 
 /// Import schemas (OpenAPI 3.x components.schemas or Swagger 2.0 definitions)
 fn import_schemas(
-    db: &Db,
+    conn: &Connection,
     project_id: &str,
     schemas: &serde_json::Map<String, Value>,
     ctx: &mut ImportCtx,
@@ -721,17 +723,23 @@ fn import_schemas(
     for (name, schema) in schemas {
         let data_json = serde_json::json!({
             "jsonSchema": schema,
+            "source": ctx.source,
         });
 
         // 按名称幂等：同名模型覆盖内容，不重复新建（走索引，不逐条查库）
-        match ctx.index.menu_id(None, "apiSchema", name).map(str::to_string) {
+        let source = ctx.source.clone();
+        match ctx
+            .index
+            .menu_id(&source, None, "apiSchema", name)
+            .map(str::to_string)
+        {
             Some(item_id) => {
                 let updates = serde_json::json!({ "name": name, "data": data_json });
-                menu_repo::update_menu_item(db, project_id, &item_id, &updates)?;
+                menu_repo::update_menu_item_conn(conn, project_id, &item_id, &updates)?;
             }
             None => {
                 let id = Uuid::new_v4().to_string();
-                ctx.index.remember_menu(None, "apiSchema", name, &id);
+                ctx.index.remember_menu(&source, None, "apiSchema", name, &id);
                 let payload = CreateMenuItemPayload {
                     id,
                     parent_id: None,
@@ -741,7 +749,7 @@ fn import_schemas(
                     run_tab_json: None,
                     sort_order: Some(ctx.sort_order),
                 };
-                menu_repo::create_menu_item(db, project_id, &payload)?;
+                menu_repo::create_menu_item_conn(conn, project_id, &payload)?;
                 ctx.sort_order += 1;
             }
         }
@@ -755,19 +763,37 @@ fn detect_and_import(
     db: &Db,
     project_id: &str,
     doc: &Value,
+    source: Option<&str>,
 ) -> Result<ProjectStateSnapshot, AppError> {
-    if doc.get("openapi").is_some() {
-        import_openapi3(db, project_id, doc)
-    } else if doc.get("swagger").is_some() {
-        import_swagger2(db, project_id, doc)
-    } else if doc.get("paths").is_some() {
-        // Treat as generic OpenAPI
-        import_openapi3(db, project_id, doc)
-    } else {
-        Err(AppError::BadRequest(
-            "不支持的文档格式，仅支持 OpenAPI 3.x、Swagger 2.0 格式".into(),
-        ))
+    // 查重索引在事务外建：一次扫表，事务里只查内存
+    let mut ctx = ImportCtx {
+        sort_order: 0,
+        source: source.unwrap_or_default().trim().to_string(),
+        folder_cache: HashMap::new(),
+        index: menu_repo::build_menu_index(db, project_id)?,
+    };
+
+    // 整批写入放进一个事务：逐条提交时每条都要 fsync，慢盘上能把一次导入
+    // 拖成几十秒；一个事务只 fsync 一次。中途失败整体回滚，不留半套数据。
+    {
+        let mut guard = db.0.lock().unwrap();
+        let tx = guard.transaction()?;
+        let conn: &Connection = &tx;
+
+        if doc.get("openapi").is_some() || doc.get("paths").is_some() {
+            import_openapi3(conn, project_id, doc, &mut ctx)?;
+        } else if doc.get("swagger").is_some() {
+            import_swagger2(conn, project_id, doc, &mut ctx)?;
+        } else {
+            return Err(AppError::BadRequest(
+                "不支持的文档格式，仅支持 OpenAPI 3.x、Swagger 2.0 格式".into(),
+            ));
+        }
+
+        tx.commit()?;
     }
+
+    project_repo::get_project_state(db, project_id)
 }
 
 pub fn import_api_document(
@@ -775,9 +801,10 @@ pub fn import_api_document(
     project_id: &str,
     format: &str,
     content: &str,
+    source: Option<&str>,
 ) -> Result<ProjectStateSnapshot, AppError> {
     let doc = parse_content(content, format)?;
-    detect_and_import(db, project_id, &doc)
+    detect_and_import(db, project_id, &doc, source)
 }
 
 #[cfg(test)]
@@ -1036,8 +1063,8 @@ mod tests {
         let db = test_db();
         let content = sample_doc().to_string();
 
-        let first = import_api_document(&db, "p1", "json", &content).unwrap();
-        let second = import_api_document(&db, "p1", "json", &content).unwrap();
+        let first = import_api_document(&db, "p1", "json", &content, Some("test-src")).unwrap();
+        let second = import_api_document(&db, "p1", "json", &content, Some("test-src")).unwrap();
         assert_eq!(
             second.menu_raw_list.len(),
             first.menu_raw_list.len(),
@@ -1069,7 +1096,7 @@ mod tests {
     #[test]
     fn import_then_export_keeps_apifox_extensions() {
         let db = test_db();
-        import_api_document(&db, "p1", "json", &sample_doc().to_string()).unwrap();
+        import_api_document(&db, "p1", "json", &sample_doc().to_string(), Some("test-src")).unwrap();
 
         let state = project_repo::get_project_state(&db, "p1").unwrap();
         let spec = crate::commands::exports::build_export_spec(&state.menu_raw_list, true, None);
@@ -1083,7 +1110,7 @@ mod tests {
     fn reimport_updates_existing_interface_in_place() {
         let db = test_db();
         let mut doc = sample_doc();
-        import_api_document(&db, "p1", "json", &doc.to_string()).unwrap();
+        import_api_document(&db, "p1", "json", &doc.to_string(), Some("test-src")).unwrap();
         let first_id = {
             let state = project_repo::get_project_state(&db, "p1").unwrap();
             state
@@ -1096,7 +1123,7 @@ mod tests {
         };
 
         doc["paths"]["/a/b"]["post"]["summary"] = json!("创建(更新)");
-        import_api_document(&db, "p1", "json", &doc.to_string()).unwrap();
+        import_api_document(&db, "p1", "json", &doc.to_string(), Some("test-src")).unwrap();
 
         let state = project_repo::get_project_state(&db, "p1").unwrap();
         let api = state
@@ -1106,6 +1133,31 @@ mod tests {
             .unwrap();
         assert_eq!(api.id, first_id, "同 method+path 应保留原 id");
         assert_eq!(api.name, "创建(更新)", "内容应被更新");
+    }
+
+    /// 不同来源的同名接口 / 目录 / 模型互不覆盖（幂等键含来源维度）。
+    #[test]
+    fn different_sources_do_not_overwrite_each_other() {
+        let db = test_db();
+        let content = sample_doc().to_string();
+
+        import_api_document(&db, "p1", "json", &content, Some("src-a")).unwrap();
+        import_api_document(&db, "p1", "json", &content, Some("src-b")).unwrap();
+
+        let state = project_repo::get_project_state(&db, "p1").unwrap();
+        let apis = state
+            .menu_raw_list
+            .iter()
+            .filter(|i| i.menu_type == "apiDetail")
+            .count();
+        let folders = state
+            .menu_raw_list
+            .iter()
+            .filter(|i| i.menu_type == "apiDetailFolder")
+            .count();
+
+        assert_eq!(apis, 2, "两个来源的同名接口应各自入库，不互相覆盖");
+        assert_eq!(folders, 6, "两个来源的目录树应各自完整");
     }
 
     /// 计费用例（不参与常规测试）：对比「逐条查重」与「一次性索引」的耗时。
@@ -1158,13 +1210,13 @@ mod tests {
         let t1 = Instant::now();
         let index = menu_repo::build_menu_index(&db, "p1").unwrap();
         for i in 0..n {
-            assert!(index.api_entry("GET", &format!("/p/{i}")).is_some());
+            assert!(index.api_entry("", "GET", &format!("/p/{i}")).is_some());
         }
         let indexed = t1.elapsed();
 
         println!("N={n}  逐条查重 {per_call:?}  一次性索引 {indexed:?}");
         assert_eq!(
-            index.api_entry("GET", "/p/0").map(|(id, _)| id.to_string()),
+            index.api_entry("", "GET", "/p/0").map(|(id, _)| id.to_string()),
             Some("api-0".to_string())
         );
     }
