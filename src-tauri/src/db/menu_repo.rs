@@ -238,7 +238,7 @@ fn load_move_row(
 }
 
 /// 判断 candidate_id 是否位于 ancestor_id 的子树内(不含自身)。
-fn is_descendant_of(
+pub fn is_descendant_of(
     conn: &Connection,
     project_id: &str,
     ancestor_id: &str,
@@ -471,6 +471,66 @@ pub fn get_menu_item(
         rusqlite::Error::QueryReturnedNoRows => Ok(None),
         other => Err(crate::errors::AppError::from(other)),
     })
+}
+
+/// 按 method + path 查找已存在的接口菜单项。
+/// 导入器与 YApi 通道共用同一判定，避免两处实现漂移。
+pub fn find_api_by_path_method(
+    db: &Db,
+    project_id: &str,
+    path: &str,
+    method: &str,
+) -> Result<Option<ApiMenuData>, crate::errors::AppError> {
+    let conn = db.0.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT id, parent_id, name, type, data_json, run_tab_json, sort_order, created_at, updated_at
+         FROM menu_items WHERE project_id = ?1 AND type = ?2 ORDER BY sort_order",
+    )?;
+    let rows = stmt.query_map(params![project_id, "apiDetail"], row_to_menu_data)?;
+    let wanted_method = method.to_uppercase();
+    for row in rows {
+        let item = row?;
+        let Some(data) = item.data_json.as_ref() else {
+            continue;
+        };
+        if data.get("path").and_then(|v| v.as_str()).unwrap_or("") != path {
+            continue;
+        }
+        if data
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_uppercase()
+            == wanted_method
+        {
+            return Ok(Some(item));
+        }
+    }
+    Ok(None)
+}
+
+/// 在指定父级下按名称查找指定类型的菜单项(导入器用于复用同名目录/模型)。
+pub fn find_menu_item_by_name(
+    db: &Db,
+    project_id: &str,
+    parent_id: Option<&str>,
+    name: &str,
+    menu_type: &str,
+) -> Result<Option<ApiMenuData>, crate::errors::AppError> {
+    let conn = db.0.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT id, parent_id, name, type, data_json, run_tab_json, sort_order, created_at, updated_at
+         FROM menu_items WHERE project_id = ?1 AND type = ?2 AND parent_id IS ?3 AND name = ?4
+         ORDER BY sort_order LIMIT 1",
+    )?;
+    let mut rows = stmt.query_map(
+        params![project_id, menu_type, parent_id, name],
+        row_to_menu_data,
+    )?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
 }
 
 pub fn get_max_sort_order(
