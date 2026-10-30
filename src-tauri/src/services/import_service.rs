@@ -8,6 +8,7 @@ use crate::db::client::Db;
 use crate::db::{menu_repo, project_repo};
 use crate::errors::AppError;
 use crate::models::{CreateMenuItemPayload, ProjectStateSnapshot};
+use crate::services::import_native;
 
 const HTTP_METHODS: &[&str] = &[
     "get", "post", "put", "delete", "patch", "options", "head", "trace",
@@ -17,7 +18,7 @@ const HTTP_METHODS: &[&str] = &[
 const PARAM_TYPES: [&str; 6] = ["integer", "string", "boolean", "number", "array", "file"];
 
 /// 前端 `ApiStatus` 枚举的合法取值，未知值降级为 designing。
-const API_STATUSES: [&str; 10] = [
+pub(crate) const API_STATUSES: [&str; 10] = [
     "designing",
     "pending",
     "developing",
@@ -37,7 +38,7 @@ const REQUEST_BODY_MEDIA_TYPES: [&str; 3] = [
     "application/x-www-form-urlencoded",
 ];
 
-fn now_iso() -> String {
+pub(crate) fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
@@ -330,14 +331,14 @@ fn split_folder_path(folder: &str) -> Vec<String> {
 ///
 /// 收拢成结构体而不是给每个函数加参数 —— 参数超过 7 个后调用点已经读不出
 /// 「谁负责改什么」。
-struct ImportCtx {
-    sort_order: i32,
+pub(crate) struct ImportCtx {
+    pub(crate) sort_order: i32,
     /// 来源标识（文件名 / 上游项目名），参与幂等键：不同来源互不覆盖
-    source: String,
+    pub(crate) source: String,
     /// 目录全路径 → 目录 id，避免同一条路径反复解析
-    folder_cache: HashMap<String, String>,
+    pub(crate) folder_cache: HashMap<String, String>,
     /// 一次性建立的查重索引
-    index: menu_repo::MenuIndex,
+    pub(crate) index: menu_repo::MenuIndex,
 }
 
 fn ensure_folder_path(
@@ -775,22 +776,39 @@ fn detect_and_import(
 
     // 整批写入放进一个事务：逐条提交时每条都要 fsync，慢盘上能把一次导入
     // 拖成几十秒；一个事务只 fsync 一次。中途失败整体回滚，不留半套数据。
+    let native = import_native::is_native_document(doc);
     {
         let mut guard = db.0.lock().unwrap();
         let tx = guard.transaction()?;
         let conn: &Connection = &tx;
 
-        if doc.get("openapi").is_some() || doc.get("paths").is_some() {
+        // Apifox 原生格式放最前面：它没有 openapi / swagger / paths 键，不会与其它格式混淆
+        if native {
+            import_native::import_native(conn, project_id, doc, &mut ctx)?;
+        } else if doc.get("openapi").is_some() || doc.get("paths").is_some() {
             import_openapi3(conn, project_id, doc, &mut ctx)?;
         } else if doc.get("swagger").is_some() {
             import_swagger2(conn, project_id, doc, &mut ctx)?;
         } else {
             return Err(AppError::BadRequest(
-                "不支持的文档格式，仅支持 OpenAPI 3.x、Swagger 2.0 格式".into(),
+                "不支持的文档格式，仅支持 Apifox 原生格式、OpenAPI 3.x、Swagger 2.0 格式".into(),
             ));
         }
 
         tx.commit()?;
+    }
+
+    // 全局变量：原生导出的 environments 恒为空，只合并全局变量。
+    // save_project_environments 内部会取 db 锁，必须放在事务外调用。
+    if native {
+        let imported = import_native::native_global_variables(doc);
+        if !imported.is_empty() {
+            let mut config =
+                project_repo::get_project_state(db, project_id)?.project_environment_config;
+            config.global_variables =
+                import_native::merge_global_variables(config.global_variables, imported);
+            menu_repo::save_project_environments(db, project_id, &config)?;
+        }
     }
 
     project_repo::get_project_state(db, project_id)
