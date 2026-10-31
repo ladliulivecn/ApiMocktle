@@ -31,6 +31,14 @@ const fail = (msg) => {
 // SDK 链接参数，链接期报 free/malloc/realloc undefined symbol。
 // cargo-xwin 自身已静态链接 VC 运行库，产物不依赖 vcruntime140/msvcp140；
 // UCRT（api-ms-win-crt-*）走系统自带，Windows 10+ 均可用。
+//
+// 清理 target 时不要用 `cargo clean --target x86_64-pc-windows-msvc`：cargo 1.97 的该选项
+// 会连同宿主侧 target/debug、target/release 一起删掉（实测 target 根目录整个消失）。
+// 要清就 `cd src-tauri && cargo clean` 整个清，或直接 rm -rf src-tauri/target/x86_64-pc-windows-msvc。
+//
+// 另：rustflags 一旦变化（如换用不同的构建命令），cargo 会把每个依赖重新编译一份，
+// 旧产物永不删除 —— 同一 crate 会出现多份 rlib（实测 serde 有 18 份），
+// target 体积可以翻几倍。保持只用本脚本这一条构建命令即可避免。
 run(`pnpm exec tauri build --target ${TRIPLE} --no-bundle --runner cargo-xwin --features portable`, ROOT)
 
 // 3. 清空并重建输出目录

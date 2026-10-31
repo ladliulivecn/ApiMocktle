@@ -5,7 +5,18 @@ edition = "2021"
 
 [lib]
 name = "apimocktle_lib"
-crate-type = ["lib", "cdylib", "staticlib"]
+# 只保留 rlib。cdylib/staticlib 仅移动端（iOS/Android）需要，
+# 桌面端会额外产出 ~1.2G 的 .so/.a/.lib，纯浪费。
+crate-type = ["lib"]
+
+# 体积优化：WSL 内只跑 cargo test / cargo clippy，GUI 调试在宿主 Windows 上做。
+# 依赖 crate 的 debuginfo 对定位无用（package."*" 不匹配本 crate 自身，已实测），
+# 关掉后依赖 rlib 缩 ~45%；本 crate 保留 line-tables-only，panic backtrace 仍有行号。
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = 0
 
 [features]
 # 便携版：数据只读写 <exe 同级>/data，不回退 app_data_dir。见 src/portable.rs
